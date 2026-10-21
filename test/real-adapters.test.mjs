@@ -4,11 +4,15 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { createRequire } from "node:module";
 import { hexToBytes } from "@kaspa-x402/core";
-import { sdk } from "../src/live/sdk.mjs";
-import { buildStandardExactPayment, createRealSellerDeps } from "../src/live/real-adapters.mjs";
+// Clean clone (R5-L4): without the rusty-kaspa WASM SDK these tests are SKIPPED with a reason instead of failing.
+// Install it with scripts/bootstrap.sh or point KASPA_WASM_SDK at an unpacked nodejs/kaspa build.
+let sdk, buildStandardExactPayment, createRealSellerDeps, NO_SDK = null;
+try { ({ sdk } = await import("../src/live/sdk.mjs")); ({ buildStandardExactPayment, createRealSellerDeps } = await import("../src/live/real-adapters.mjs")); }
+catch (e) { NO_SDK = `Kaspa WASM SDK not available (${String(e?.message ?? e).split("\n")[0].slice(0, 120)}); run scripts/bootstrap.sh or set KASPA_WASM_SDK`; }
+const T = (n, o, f) => (typeof o === "function" ? test(n, { skip: NO_SDK ?? false }, o) : test(n, { ...o, skip: NO_SDK ?? o.skip }, f));
 const { schnorr } = createRequire(import.meta.url)("@noble/curves/secp256k1");
 
-test("real builder: signed TN10 tx pays exactly the price to payTo, change back, auth sig valid", () => {
+T("real builder: signed TN10 tx pays exactly the price to payTo, change back, auth sig valid", () => {
   const keyHex = crypto.randomBytes(32).toString("hex"); const key = new sdk.PrivateKey(keyHex);
   const payer = key.toAddress("testnet-10").toString();
   const merchant = new sdk.PrivateKey(crypto.randomBytes(32).toString("hex")).toAddress("testnet-10").toString();
@@ -26,10 +30,10 @@ test("real builder: signed TN10 tx pays exactly the price to payTo, change back,
     schnorr.getPublicKey(hexToBytes(keyHex))));
   assert.match(a.transaction, /.+/); assert.ok(!a.transaction.includes(keyHex), "key never serialized");
 });
-test("real seller deps refuse mainnet-bound construction paths", () => {
+T("real seller deps refuse mainnet-bound construction paths", () => {
   const d = createRealSellerDeps(); assert.equal(d.rest.network, "kaspa:testnet-10");
 });
-test("LIVE: real gateway issues 402 bound to the real merchant script; unfunded payer fails closed", { skip: !process.env.LIVE }, async () => {
+T("LIVE: real gateway issues 402 bound to the real merchant script; unfunded payer fails closed", { skip: !process.env.LIVE }, async () => {
   const { createUpstream } = await import("../src/demo-upstream.mjs");
   const { createGateway } = await import("../src/gateway.mjs");
   const { validateConfig } = await import("../src/config.mjs");
@@ -54,7 +58,7 @@ test("LIVE: real gateway issues 402 bound to the real merchant script; unfunded 
   assert.equal(gw.ledger.summary().paidRequests, 0);
   gs.close(); up.close(); await rpc.disconnect();
 });
-test("M3: fee = max(floor, mass x feerate); change below 0.1 KAS refused (not burned); storage-mass limit enforced", () => {
+T("M3: fee = max(floor, mass x feerate); change below 0.1 KAS refused (not burned); storage-mass limit enforced", () => {
   const keyHex = crypto.randomBytes(32).toString("hex"); const payer = new sdk.PrivateKey(keyHex).toAddress("testnet-10").toString();
   const merchant = new sdk.PrivateKey(crypto.randomBytes(32).toString("hex")).toAddress("testnet-10").toString();
   const mk = (amount) => ({ outpoint: { transactionId: "cd".repeat(32), index: 0 }, amount, scriptPublicKey: sdk.payToAddressScript(payer) });
@@ -74,7 +78,7 @@ test("M3: fee = max(floor, mass x feerate); change below 0.1 KAS refused (not bu
   assert.equal(BigInt(sdk.Transaction.deserializeFromSafeJSON(exact.transaction).serializeToObject().outputs.length), 1n, "exact-change: no change output");
   assert.throws(() => buildStandardExactPayment({ request, keyHex, payerAddress: payer, utxo: mk(1_000_000_000n), maxStorageMass: 50_000n }), /storage mass/);
 });
-test("M4: concurrent payExactTransaction calls never select the same UTXO", async () => {
+T("M4: concurrent payExactTransaction calls never select the same UTXO", async () => {
   const { RealTn10FundingProvider } = await import("../src/live/real-adapters.mjs");
   const keyHex = crypto.randomBytes(32).toString("hex"); const payer = new sdk.PrivateKey(keyHex).toAddress("testnet-10").toString();
   const merchant = new sdk.PrivateKey(crypto.randomBytes(32).toString("hex")).toAddress("testnet-10").toString();

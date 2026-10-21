@@ -67,7 +67,8 @@ const checkEndpoint = (e) => { if (!(/^wss:\/\//.test(e) || LOCAL.test(e))) thro
  * agreement). Set cfg.pnnTrust.mode = "quorum", or env X402_PNN_DEFAULT_QUORUM=1 for a 2-of-N quorum over `endpoints`.
  *  - quorum (opt-in): every authority is a separate KaspaPnnClient in its own trust domain; evidence must
  *    agree across `required` (>= 2) of them (upstream CorroboratedKaspaPnnClient). Submission goes to `submission`
- *    (default: the first authority). A local node is just another authority: { trustDomain: "local", endpoints: ["ws://127.0.0.1:17210/..."] }.
+ *    (default: the first authority). A local node is just another authority: { trustDomain: "local", endpoints: ["ws://127.0.0.1:18210"] }
+ *    (wRPC JSON, testnet port 18210; kaspad serves it only with --rpclisten-json).
  *  - single: one trusted source (e.g. your own node); explicit opt-in only.
  */
 export function buildPnnPolicy({ trust, endpoints, timeoutMs, attempts }) {
@@ -85,7 +86,7 @@ export function buildPnnPolicy({ trust, endpoints, timeoutMs, attempts }) {
   const required = Number(t.required ?? 2); if (!(required >= 2 && required <= authorities.length)) throw new Error("pnn quorum: required must be >= 2 and <= number of authorities");
   const submission = t.submission ? mk(t.submission) : authorities[0].client;
   const corr = selectPnnChainEvidenceClient({ mode: "independent-corroboration", submission, authorities, requiredAuthorities: required });
-  return { client: submission, mode: "quorum", required, domains: authorities.map((a) => a.trustDomain), pnn: withMinDepth(corr, authorities) };
+  return { client: submission, mode: "quorum", required, domains: authorities.map((a) => a.trustDomain), pnn: withMinDepth(corr, authorities, required) };
 }
 
 export function createPnnExactDepsFactory({ endpoints, trust, finality = "accepted", db = null, confirmations, timeoutMs = 15_000, attempts = 2, owner, pnnClient } = {}) {
@@ -108,36 +109,66 @@ export function createPnnExactDepsFactory({ endpoints, trust, finality = "accept
       },
       exactSettlementReconciler: new VerifiedExactSettlementReconciler(evidence),
       exactHeadReconciler: new VerifiedExactHeadReconciler(evidence),
-      // R2-P0-2 (DEFERRED, see FIXES.md): "confirmed" (deliver only at `confirmations` depth) is supported via
+      // R2-P0-2 (DEFERRED; README Known limitations): "confirmed" (deliver only at `confirmations` depth) is supported via
       // cfg.exactFinality but failed live on TN10: re-verifying the broadcast tx at depth through the public PNN nodes
       // errors ("selected-chain positions ended before the pinned checkpoint"), so every attempt became paid-without-data.
       // Default stays "accepted" (node-proven acceptance, depth 0), which is live-proven to deliver.
       acceptedFinality: finality,
     };
   };
+  // R5-M4: depth capability probe used by the depth-gated preflight: prove a known deep tx at `confirmations` on the
+  // same (corroborated, min-depth) client that will verify the payment. Throws when depth cannot be proven.
+  factory.probeDepth = async (txid) => {
+    const f = await pnn.findAcceptedTransaction(String(txid).toLowerCase());
+    if (!f?.evidence || f.evidence.status === "unknown" || !f.evidence.acceptingBlockHash) throw new Error(`depth probe: ${txid} not proven accepted`);
+    const c = await pnn.confirmAcceptedTransaction(f.evidence, confirmations);
+    if (c?.confirmationCount != null && BigInt(c.confirmationCount) < BigInt(confirmations)) throw new Error(`depth probe: ${c.confirmationCount} < ${confirmations} confirmations`);
+    return c; };
   factory.health = () => client.health(); factory.evidenceStore = evidenceStore; factory.trust = { mode: policy.mode, required: policy.required, domains: policy.domains };
   return factory;
 }
 
 /**
- * R3-M1 (protocol): upstream corroboration strips confirmationCount before comparing and returns the FIRST authority's
- * answer, so one authority could overstate depth. Wrap the corroborated client: after it agrees on the facts, ask every
- * authority again and report the MINIMUM confirmationCount among those that answered (none answering -> the
- * corroborated value is kept only if it is itself the minimum known). Depth is never raised, only lowered.
+ * R3-M1 / R5-M2 / R5-M3 (protocol): upstream corroboration strips confirmationCount before comparing and returns the
+ * FIRST authority's answer, so one authority could overstate depth. Wrap the corroborated client: after it agrees on
+ * the facts, ask every authority again and report the MINIMUM confirmationCount. At least `required` authorities must
+ * answer the second round with a depth, otherwise the call FAILS CLOSED (a silent or failing honest authority can no
+ * longer leave a deeper value standing). Depth is never raised, only lowered. discoverCovenantLineage (batch lineage
+ * depth) is wrapped too: every transition / genesis acceptance gets the minimum over the authorities.
  */
-export function withMinDepth(corr, authorities) {
-  const lower = (val, pick) => (min) => { const ev = pick(val); if (!ev || ev.confirmationCount == null || min == null) return val;
-    const cur = BigInt(ev.confirmationCount); if (BigInt(min) >= cur) return val;
-    const out = structuredClone(val); const e2 = pick(out); e2.confirmationCount = typeof ev.confirmationCount === "number" ? Number(min) : (typeof ev.confirmationCount === "bigint" ? BigInt(min) : String(min)); return out; };
+export function withMinDepth(corr, authorities, required = 2) {
+  const need = Math.max(1, Math.min(Number(required) || 1, authorities.length));
+  const setCount = (ev, min) => { ev.confirmationCount = typeof ev.confirmationCount === "number" ? Number(min) : (typeof ev.confirmationCount === "bigint" ? BigInt(min) : String(min)); };
+  const second = async (method, a) => {
+    const all = await Promise.allSettled(authorities.map((x) => x.client[method](...a)));
+    const ok = all.filter((s) => s.status === "fulfilled" && s.value).map((s) => s.value);
+    return ok; };
   const wrap = (method, pick) => { const f = corr[method]?.bind(corr); if (!f) return;
-    corr[method] = async (...a) => { const r = await f(...a); if (!r || pick(r)?.confirmationCount == null) return r;
-      const all = await Promise.allSettled(authorities.map((x) => x.client[method](...a)));
-      let min = null; for (const s of all) { const c = s.status === "fulfilled" && s.value ? pick(s.value)?.confirmationCount : null;
-        if (c != null && (min == null || BigInt(c) < BigInt(min))) min = c; }
-      return lower(r, pick)(min); }; };
+    corr[method] = async (...a) => { const r = await f(...a); const ev = r ? pick(r) : null; if (!ev || ev.confirmationCount == null) return r;
+      const counts = (await second(method, a)).map((v) => pick(v)?.confirmationCount).filter((c) => c != null);
+      if (counts.length < need) throw new Error(`pnn quorum: only ${counts.length} of ${need} required authorities proved depth (${method}); failing closed`);
+      let min = BigInt(ev.confirmationCount); for (const c of counts) if (BigInt(c) < min) min = BigInt(c);
+      if (min >= BigInt(ev.confirmationCount)) return r;
+      const out = structuredClone(r); setCount(pick(out), min); return out; }; };
   wrap("confirmAcceptedTransaction", (v) => v);
   wrap("findAcceptedTransaction", (v) => v?.evidence);
   wrap("findHashChainPayment", (v) => v?.evidence);
+  // lineage: acceptances keyed by blockHash + transition index (genesis: blockHash + "g")
+  const acceptances = (v) => { const m = new Map();
+    for (const b of v?.addedChainBlocks ?? []) { if (b.genesisAcceptance) m.set(`${b.blockHash}:g`, b.genesisAcceptance);
+      (b.transitions ?? []).forEach((t, i) => { if (t.acceptance) m.set(`${b.blockHash}:${i}`, t.acceptance); }); }
+    return m; };
+  const lf = corr.discoverCovenantLineage?.bind(corr);
+  if (lf) corr.discoverCovenantLineage = async (...a) => {
+    const r = await lf(...a); const mine = acceptances(r); if (![...mine.values()].some((e) => e.confirmationCount != null)) return r;
+    const others = (await second("discoverCovenantLineage", a)).map(acceptances);
+    const out = structuredClone(r); const outAcc = acceptances(out);
+    for (const [k, ev] of outAcc) { if (ev.confirmationCount == null) continue;
+      const counts = others.map((m) => m.get(k)?.confirmationCount).filter((c) => c != null);
+      if (counts.length < need) throw new Error(`pnn quorum: only ${counts.length} of ${need} required authorities proved lineage depth; failing closed`);
+      let min = BigInt(ev.confirmationCount); for (const c of counts) if (BigInt(c) < min) min = BigInt(c);
+      setCount(ev, min); }
+    return out; };
   corr.minDepthAcrossAuthorities = true;
   return corr;
 }

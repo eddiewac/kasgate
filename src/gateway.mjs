@@ -72,9 +72,20 @@ export function createGateway(cfg, { ledgerPath = null, db = null, passwordHash 
     ? (typeof realDeps === "function" ? realDeps : realDeps ? () => realDeps
       : createPnnExactDepsFactory({ endpoints: cfg.pnnEndpoints, trust: cfg.pnnTrust, finality: cfg.exactFinality ?? "accepted", db, confirmations, owner: async (txid) => !!(await store.loadExactSettlementAttempt(txid)) }))
     : () => ({ addressCodec: world?.addressCodec ?? new MockAddressCodec(), chainProvider: world?.chainProvider ?? new MockChainProvider(), exactTransactionVerifier: mockExactTransactionVerifier });
-  // R3-M3: in depth-gated mode (exactFinality "confirmed") the node must be able to serve evidence BEFORE we let
-  // upstream broadcast. Default preflight = PNN health (real chain); tests inject their own.
-  const preflight = exactFinality !== "confirmed" ? null : (depthPreflight ?? (exactDeps?.health ? () => exactDeps.health() : null));
+  // R3-M3 / R5-M4: in depth-gated mode (exactFinality "confirmed") the node(s) must PROVE depth BEFORE we let upstream
+  // broadcast: a health check is not enough (the live failure was on healthy nodes). Default preflight = a depth proof
+  // (find + confirm at `confirmations`) of a known deep tx on the same authorities: cfg.depthProbeTxid, else the most
+  // recent exact payment this gateway delivered more than 60 s ago. No probe tx or no probe support -> fail closed
+  // (503 depth_verification_unavailable, nothing broadcast). Tests inject their own.
+  const probeTxid = () => { if (cfg.depthProbeTxid) return String(cfg.depthProbeTxid).toLowerCase(); if (!db) return null;
+    const cutoff = Date.now() - 60_000;
+    for (const r of db.prepare("SELECT k, v FROM kv WHERE ns='exact-seen' ORDER BY rowid DESC LIMIT 50").all()) { let at = 0; try { at = Date.parse(JSON.parse(r.v).at); } catch {} if (at && at < cutoff) return r.k; }
+    return null; };
+  const defaultDepthPreflight = async () => {
+    if (typeof exactDeps?.probeDepth !== "function") throw new Error("depth probe not supported by these chain deps");
+    const tx = probeTxid(); if (!tx) throw new Error("no deep probe tx known yet (set depthProbeTxid)");
+    await exactDeps.probeDepth(tx); };
+  const preflight = exactFinality !== "confirmed" ? null : (depthPreflight ?? defaultDepthPreflight);
   // R3-M3: payments broadcast but not yet provable at depth are HELD as pending (durable) and delivered on a retry of
   // the same payment, instead of ending as paid-without-data.
   const pendingMem = new Map(), payIdMem = new Map();
@@ -85,6 +96,27 @@ export function createGateway(cfg, { ledgerPath = null, db = null, passwordHash 
       delete: (k) => db.prepare("DELETE FROM kv WHERE ns='exact-pending' AND k=?").run(k),
       list: () => db.prepare("SELECT k, v FROM kv WHERE ns='exact-pending'").all().map((r) => ({ txid: r.k, ...JSON.parse(r.v) })) }
     : { set: (k, v) => pendingMem.set(k, v), get: (k) => pendingMem.get(k), delete: (k) => pendingMem.delete(k), list: () => [...pendingMem].map(([txid, v]) => ({ txid, ...v })) };
+  // R5-L3: pending payments expire. After pendingTtlMs (default 10 min, well past the client's authorization expiry) a
+  // held payment moves to the refund-due queue: retries get 410 payment_expired_refund_due (never served, never a 402
+  // that invites a 2nd payment), the ledger books "pending-expired", and an operator refunds it and records the
+  // refund txid with markRefunded() / `x402-gateway refunds`. Refunds are operator-approved, never automatic.
+  const pendingTtlMs = Number(cfg.exactPendingTtlMs ?? 600_000);
+  const refundMem = new Map();
+  const refunds = db ? { set: (k, v) => db.prepare("INSERT OR REPLACE INTO kv (ns,k,v) VALUES ('exact-refund-due',?,?)").run(k, JSON.stringify(v)),
+      get: (k) => { const r = db.prepare("SELECT v FROM kv WHERE ns='exact-refund-due' AND k=?").get(k); return r ? JSON.parse(r.v) : undefined; },
+      list: () => db.prepare("SELECT k, v FROM kv WHERE ns='exact-refund-due'").all().map((r) => ({ txid: r.k, ...JSON.parse(r.v) })) }
+    : { set: (k, v) => refundMem.set(k, v), get: (k) => refundMem.get(k), list: () => [...refundMem].map(([txid, v]) => ({ txid, ...v })) };
+  const expirePending = (now = Date.now()) => { const out = [];
+    for (const p of pending.list()) { if (now - Date.parse(p.firstAt) < pendingTtlMs) continue;
+      const { txid, ...rest } = p; refunds.set(txid, { ...rest, status: "refund-due", expiredAt: new Date(now).toISOString() }); pending.delete(txid);
+      ledger.record({ outcome: "pending-expired", route: p.route, path: p.path, amountSompi: "0", txid, refundDueSompi: String(p.amountSompi), error: `pending > ${pendingTtlMs} ms; refund due` });
+      out.push(txid); }
+    return out; };
+  const markRefunded = (txid, refundTxid) => { const r = refunds.get(txid); if (!r) throw new Error(`no refund-due entry for ${txid}`);
+    if (!/^[0-9a-f]{64}$/i.test(String(refundTxid))) throw new Error("refund txid must be 64 hex");
+    refunds.set(txid, { ...r, status: "refunded", refundTxid: String(refundTxid).toLowerCase(), refundedAt: new Date().toISOString() });
+    ledger.record({ outcome: "refunded", route: r.route, path: r.path, amountSompi: "0", txid, refundTxid: String(refundTxid).toLowerCase(), refundSompi: String(r.amountSompi) }); };
+  const pendingTimer = hasExact ? setInterval(() => { try { expirePending(); } catch (e) { console.error(`[x402] expirePending: ${e?.message}`); } }, Math.min(60_000, Math.max(1000, pendingTtlMs / 4))) : null; pendingTimer?.unref?.();
   // In-memory store (no db): claim + evidence save are trivially "atomic" (single process, nothing durable).
   if (!store.claimExactSettlementWithEvidence) store.claimExactSettlementWithEvidence = async (attempt, receipt) => {
     if (receipt?.transactionId !== attempt?.transactionId) throw new Error("PNN evidence does not match exact settlement claim");
@@ -160,6 +192,19 @@ export function createGateway(cfg, { ledgerPath = null, db = null, passwordHash 
   // so every channel is claimable from its first call and "free below the minimum" is gone. Real chain default:
   // minNet + claim fee; mock/tests: opt-in via batch.openChargeSompi.
   const openCharge = cfg.batch?.openChargeSompi != null ? BigInt(cfg.batch.openChargeSompi) : (chain === "real" && world ? minNet + claimFee : null);
+  // R5-M1 (specialist): an open charge below the claim minimum would bill the open price on EVERY call until the
+  // channel crosses the minimum (never agreed by the client). Refuse such a config.
+  if (openCharge != null && openCharge < minNet + claimFee) throw new Error(`batch.openChargeSompi (${openCharge}) must be >= settlement.minClaimNetSompi + claim fee (${minNet + claimFee})`);
+  // R5-M1 / R5-L1: ONE "below the claim minimum" rule for the 402 challenge, the paid price and the per-IP cap.
+  // With an open charge: a channel is below minimum until its cumulative charge reaches the threshold recorded when
+  // its open charge was accepted (config changes after a restart never re-charge it). Post-claim residue below the
+  // minimum is accepted (bounded, booked as accepted-loss at the refund window; README Known limitations).
+  // Without an open charge: unclaimed value (charged - claimed) below minNet + claim fee (P0-5).
+  const openThreshold = (cid) => { const r = db && cid ? db.prepare("SELECT v FROM kv WHERE ns='batch-open-charged' AND k=?").get(String(cid).toLowerCase()) : null;
+    return r ? BigInt(JSON.parse(r.v).thresholdSompi) : minNet + claimFee; };
+  const channelBelowMin = (c) => { if (!c) return true; const charged = BigInt(c.chargedCumulativeAmount ?? 0);
+    if (openCharge != null) return charged < openThreshold(c.channelId ?? c.id);
+    return charged - BigInt(c.claimedCumulativeAmount ?? 0) < minNet + claimFee; };
   const maxSubMinPerIp = cfg.batch?.maxSubMinimumChannelsPerClient != null ? Number(cfg.batch.maxSubMinimumChannelsPerClient) : (chain === "real" ? 1 : null);
   // Hop-by-hop + framing headers are never forwarded; payment-* / set-cookie from upstream are dropped so the
   // origin cannot spoof x402 headers or set cookies on the gateway's origin.
@@ -338,7 +383,7 @@ export function createGateway(cfg, { ledgerPath = null, db = null, passwordHash 
       if (u.pathname.startsWith(cfg.dashboard.path)) {
         if (!authed(req)) { if (sessions.enabled && !u.pathname.endsWith(".json")) { res.writeHead(303, { location: "/_x402/login" }); return res.end(); }
           return send(401, {}, { error: sessions.enabled ? "login required" : "dashboard token required" }); }
-        const s = { ...ledger.summary({ runId: u.searchParams.get("run") ?? undefined }), chain, runId, autoClaims: autoClaims.slice(-20), recovery, pendingExact: pending.list(), refundTimeoutDaa: currentTimeout.toString() };
+        const s = { ...ledger.summary({ runId: u.searchParams.get("run") ?? undefined }), chain, runId, autoClaims: autoClaims.slice(-20), recovery, replayErrors: store.replayFailed ?? [], pendingExact: pending.list(), refundsDue: refunds.list(), refundTimeoutDaa: currentTimeout.toString() };
         return u.pathname.endsWith(".json") ? send(200, {}, s) : send(200, {}, dashboardHtml(s, { refreshSec: Math.min(60, Math.max(0, Number.parseInt(u.searchParams.get("refresh") ?? "0", 10) || 0)) }));
       }
       if (u.pathname === "/_x402/claim" && req.method === "POST") {
@@ -364,6 +409,9 @@ export function createGateway(cfg, { ledgerPath = null, db = null, passwordHash 
       // UTXO inputs, payTo/amount, request-bound authorization) and BEFORE settlement. If the origin fails we
       // throw out of verification, nothing is claimed or broadcast, and the payer gets 503 + retry-same-payment.
       // Order: verify -> fetch origin -> settle (broadcast + confirmations) -> handler returns the fetched result.
+      // R5-M3: a failed journal replay means channel/settlement state cannot be trusted: no paid route is served.
+      if (store.replayFailed) { ledger.record({ outcome: "store-replay-failed", route: route.match, path: u.pathname, amountSompi: "0" });
+        return send(503, { "retry-after": "60" }, { error: "gateway_state_unavailable", detail: "payment state failed to restore; nothing was charged", retryable: true }); }
       const ctx = { txid: null, originFailed: null, consumed: false, limited: false };
       const onVerified = async (v) => {
         const txid = String(v.transactionId).toLowerCase(); ctx.txid = txid;
@@ -383,7 +431,7 @@ export function createGateway(cfg, { ledgerPath = null, db = null, passwordHash 
       // P0-5: bound free calls below the claim minimum. Upstream vouchers charge exactly the route price per call,
       // so a channel whose total stays under (minNet + claim fee) can never be claimed profitably. Limit how many
       // such "sub-minimum" open channels one client (IP) may hold; a new channel open beyond that is refused.
-      let openingBatch = null, openIpk = null, openBefore = null, payAmount = route.priceSompi;
+      let openingBatch = null, openIpk = null, openBefore = null, payAmount = route.priceSompi, batchChannelId = null;
       const batchIpk = ipKey(clientIp(req));
       /** active channels recorded for this client key, and how many are below the claim minimum */
       const ipChannels = async (ipk) => { let all = 0, sub = 0;
@@ -392,10 +440,12 @@ export function createGateway(cfg, { ledgerPath = null, db = null, passwordHash 
           const c = await store.loadChannel(r.k); if (!c || c.status !== "active") continue;
           // channels already inside the claim margin take no more vouchers (their loss, if any, is booked) -> not counted
           if (BigInt(c.channelConfig?.refundTimeoutDaa ?? 2n ** 62n) - lastDaa <= margin) continue;
-          all++; if (BigInt(c.chargedCumulativeAmount ?? 0) - BigInt(c.claimedCumulativeAmount ?? 0) < minNet + claimFee) sub++; }
+          all++; if (channelBelowMin(c)) sub++; }
         return { all, sub }; };
       const openPrice = openCharge != null && openCharge > BigInt(route.priceSompi) ? openCharge.toString() : null;
-      if (route.scheme === "batch-settlement" && !req.headers["payment-signature"] && openPrice && (await ipChannels(batchIpk)).all === 0) payAmount = openPrice; // challenge to a client with no channel
+      // R5-M1: the challenge uses the same rule as the paid request: unless this client already holds a channel that is
+      // past the claim minimum (it will pay the route price on it), offer the open price.
+      if (route.scheme === "batch-settlement" && !req.headers["payment-signature"] && openPrice) { const ic = await ipChannels(batchIpk); if (ic.all === 0 || ic.sub > 0) payAmount = openPrice; }
       if (route.scheme === "batch-settlement" && req.headers["payment-signature"]) {
         // R2-P0-1: "new channel" is decided from SERVER state (channel id unknown to the store), not from whether the
         // client chose to include fundingTransaction. Unparseable / id-less payloads count as new (fail closed).
@@ -407,8 +457,8 @@ export function createGateway(cfg, { ledgerPath = null, db = null, passwordHash 
         const isNew = !known;
         // R4-M3: price from SERVER state, never the client's accepted.amount. A channel whose open failed (charged 0) or
         // that is otherwise still below the claim minimum pays the open charge again until it is claimable.
-        if (openPrice) { const net = isNew ? 0n : BigInt(known.chargedCumulativeAmount ?? 0);
-          payAmount = isNew || net < minNet + claimFee ? openPrice : route.priceSompi; }
+        if (openPrice) payAmount = channelBelowMin(known) ? openPrice : route.priceSompi;
+        batchChannelId = id;
         void signed;
         if (isNew && db && (maxSubMinPerIp != null || openPrice)) {
           const ipk = batchIpk;
@@ -496,6 +546,10 @@ export function createGateway(cfg, { ledgerPath = null, db = null, passwordHash 
         const ptx = handlerTxid ?? ctx.txid ?? payIds.get(sigPaymentId(req.headers["payment-signature"]));
         const att = ptx ? await store.loadExactSettlementAttempt(ptx).catch(() => null) : null;
         if (att && !(await store.loadExactPayment(ptx).catch(() => null))) {
+          const due = refunds.get(ptx);
+          if (due) { ledger.record({ outcome: "rejected", route: route.match, path: u.pathname, amountSompi: "0", txid: ptx, error: `payment ${due.status}` });
+            return send(410, {}, { error: due.status === "refunded" ? "payment_refunded" : "payment_expired_refund_due", txid: ptx, retryable: false,
+              detail: "this payment was held too long without delivery; it is queued for a refund by the operator (or already refunded). Do not pay again for this request without a new authorization." }); }
           const prev = pending.get(ptx); pending.set(ptx, { route: route.match, path: u.pathname, amountSompi: att.amount ?? route.priceSompi, firstAt: prev?.firstAt ?? new Date().toISOString(), lastAt: new Date().toISOString(), tries: (prev?.tries ?? 0) + 1, lastStatus: resp.status, lastError: resp.body?.error ?? null });
           ledger.record({ outcome: "payment-pending", route: route.match, path: u.pathname, amountSompi: "0", txid: ptx, error: resp.body?.error ?? `status ${resp.status}` });
           return send(503, { "retry-after": "10" }, { error: "payment_pending", txid: ptx, retryable: true,
@@ -508,8 +562,13 @@ export function createGateway(cfg, { ledgerPath = null, db = null, passwordHash 
         let txid; try { txid = decodePaymentResponseHeader(resp.headers[headerName]).transaction; } catch {}
         let decoded = {}; try { decoded = decodePaymentResponseHeader(resp.headers[headerName]) ?? {}; } catch {}
         if (route.scheme === "batch-settlement") {
+          const paidCh = decoded.extensions?.kaspa?.channelId ?? decoded.channelId ?? null;
           ledger.record({ outcome: "paid", scheme: "batch-settlement", route: route.match, path: u.pathname, amountSompi: paidRequest.paymentAmount, upstreamStatus,
-            channelId: decoded.extensions?.kaspa?.channelId ?? decoded.channelId ?? null, settled: false });
+            channelId: paidCh, settled: false });
+          // R5-L1: remember the threshold this channel's open charge satisfied.
+          const ocid = String(paidCh ?? batchChannelId ?? "").toLowerCase();
+          if (db && openCharge != null && paidRequest.paymentAmount === openPrice && ocid && !ocid.startsWith("unknown:"))
+            db.prepare("INSERT OR IGNORE INTO kv (ns,k,v) VALUES ('batch-open-charged',?,?)").run(ocid, JSON.stringify({ thresholdSompi: (minNet + claimFee).toString(), at: new Date().toISOString() }));
           if (st.claimEveryCalls && ++sinceClaim >= Number(st.claimEveryCalls)) autoClaim(`every ${st.claimEveryCalls} calls`);
         } else if (txid && ledger.entries.some((e) => e.outcome === "paid" && e.txid === txid))
           ledger.record({ outcome: "replay-cached", route: route.match, path: u.pathname, amountSompi: "0", txid });
@@ -524,8 +583,8 @@ export function createGateway(cfg, { ledgerPath = null, db = null, passwordHash 
       return send(resp.status, resp.status === 402 ? resp.headers : { ...upHeaders, ...resp.headers }, resp.body);
     } catch (err) { const id = randomUUID().slice(0, 8); console.error(`[x402-error ${id}] ${err?.stack ?? err}`); return send(502, {}, { error: "gateway error", id }); } // L6
   };
-  return { handler, ledger, confirmations, pendingExact: () => pending.list(), get server() { return server; }, store, chain, world, claimAll, claimNearTimeout, autoClaims, recovery, recovered, runId,
-    refundTimeout: () => currentTimeout, rotate: rotateIfNeeded, settle: () => claiming, close: () => { if (timer) clearInterval(timer); if (nearTimer) clearInterval(nearTimer); if (recoveryTimer) clearInterval(recoveryTimer); }, listen: (port = cfg.listen.port, host = cfg.listen.host) =>
+  return { handler, ledger, confirmations, pendingExact: () => pending.list(), expirePending, refundsDue: () => refunds.list(), markRefunded, get server() { return server; }, store, chain, world, claimAll, claimNearTimeout, autoClaims, recovery, recovered, runId,
+    refundTimeout: () => currentTimeout, rotate: rotateIfNeeded, settle: () => claiming, close: () => { if (pendingTimer) clearInterval(pendingTimer); if (timer) clearInterval(timer); if (nearTimer) clearInterval(nearTimer); if (recoveryTimer) clearInterval(recoveryTimer); }, listen: (port = cfg.listen.port, host = cfg.listen.host) =>
     new Promise((ok) => { const s = http.createServer(handler).listen(port, host, () => ok(s)); }) };
 }
 

@@ -64,6 +64,8 @@ export function validateConfig(cfg) {
   if (cfg.confirmations != null && !(Number.isSafeInteger(Number(cfg.confirmations)) && Number(cfg.confirmations) >= 1)) throw new Error("confirmations must be a positive integer");
   if (cfg.confirmations != null) cfg.confirmations = Number(cfg.confirmations);
   if (cfg.exactFinality != null && !["confirmed", "accepted"].includes(cfg.exactFinality)) throw new Error("exactFinality must be confirmed|accepted");
+  if (cfg.exactPendingTtlMs != null && !(Number.isSafeInteger(Number(cfg.exactPendingTtlMs)) && Number(cfg.exactPendingTtlMs) >= 1000)) throw new Error("exactPendingTtlMs must be an integer >= 1000");
+  if (cfg.depthProbeTxid != null && !/^[0-9a-fA-F]{64}$/.test(String(cfg.depthProbeTxid))) throw new Error("depthProbeTxid must be a 64-hex txid");
   if (cfg.pnnTrust != null && !["quorum", "single"].includes(cfg.pnnTrust.mode)) throw new Error("pnnTrust.mode must be quorum|single");
   if (cfg.pnnEndpoints != null && (!Array.isArray(cfg.pnnEndpoints) || cfg.pnnEndpoints.some((e) => !/^wss:\/\/.+testnet-10/.test(String(e))))) throw new Error("pnnEndpoints must be a list of wss:// testnet-10 node URLs");
   if (cfg.trustedProxies != null && !Array.isArray(cfg.trustedProxies)) throw new Error("trustedProxies must be a list of proxy IPs");

@@ -6,8 +6,9 @@ labels: ["operator", "testnet-10"]
 assignees: []
 ---
 > Testnet-10 only. Never share private keys, seeds or wallet files. Only post an endpoint you're happy to make public.
+> **Privacy: everything in this issue is public.** Use a public handle (GitHub/X/Discord), not a personal email or phone number. Hosting provider, ASN, region and endpoints will be visible to everyone; share only what you're comfortable publishing, or say "available on request".
 
-**Operator / contact:** 
+**Operator / public handle:** (no personal email or phone) 
 **Independent of other listed operators?** (hosting provider, org, ASN) 
 **Region / hosting:** 
 
@@ -16,6 +17,7 @@ assignees: []
 - Network: testnet-10 (`--testnet --netsuffix=10`) [ ]
 - Flags (full command line or config file, secrets redacted):
 - `--utxoindex` enabled [ ]
+- wRPC JSON enabled (`--rpclisten-json=...`; off by default; testnet JSON port 18210, Borsh 17210) [ ]
 - wRPC JSON endpoint (wss://...): 
 - wRPC Borsh endpoint (optional): 
 - TLS / reverse proxy: 

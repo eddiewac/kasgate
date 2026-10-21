@@ -65,9 +65,9 @@ function writeThrough(instance, Proto, persist, before = () => {}) {
  * On start a fresh MemoryServerChannelStore is rebuilt by replaying the journal through upstream's own
  * validated transitions with the clock frozen at each row's timestamp, so exact attempts (accepted, handler
  * started/recorded/recovery-required, committed replays) and batch/claim state survive a restart.
- * Legacy snapshot rows (pre-journal) are the baseline. Compaction is deferred (FIXES.md).
+ * Legacy snapshot rows (pre-journal) are the baseline. Compaction is deferred (README Known limitations).
  */
-export function createPersistentServerStore(db, ns = "server-channels", { onFatal = (e) => { console.error(`[x402-store] FATAL journal write failed, exiting: ${e?.message}`); process.exit(70); } } = {}) {
+export function createPersistentServerStore(db, ns = "server-channels", { ackReplayErrors = /^(1|true)$/i.test(process.env.X402_ACK_REPLAY_ERRORS ?? ""), onFatal = (e) => { console.error(`[x402-store] FATAL journal write failed, exiting: ${e?.message}`); process.exit(70); } } = {}) {
   db.exec("CREATE TABLE IF NOT EXISTS store_journal (seq INTEGER PRIMARY KEY AUTOINCREMENT, ns TEXT NOT NULL, at INTEGER NOT NULL, method TEXT NOT NULL, args TEXT NOT NULL)");
   const rows = new Map(kvAll(db, ns));
   const channels = [...rows].filter(([k]) => k.startsWith("channel:")).map(([, v]) => v);
@@ -81,6 +81,7 @@ export function createPersistentServerStore(db, ns = "server-channels", { onFata
     if (typeof fn !== "function" || READ.test(name)) continue;
     store[name] = async (...a) => {
       if (replaying) await store.ready; // no live transition before the journal is replayed
+      if (store.replayFailed) throw new Error("journal replay failed; state transitions refused until reconciled (fail closed)");
       const at = Date.now(); const r = await fn.apply(store, a);
       try { ins.run(ns, at, name, enc(scrub(a))); } catch (e) { onFatal(e); throw e; }
       return r;
@@ -96,6 +97,7 @@ export function createPersistentServerStore(db, ns = "server-channels", { onFata
     signal?.throwIfAborted?.();
     if (!receipt || receipt.transactionId !== attempt?.transactionId) throw new Error("PNN evidence does not match exact settlement claim");
     if (replaying) await store.ready;
+    if (store.replayFailed) throw new Error("journal replay failed; state transitions refused until reconciled (fail closed)");
     const at = Date.now(); const r = await MemoryServerChannelStore.prototype.claimExactSettlement.call(store, attempt);
     try { claimTx(at, attempt, receipt); } catch (e) { onFatal(e); throw e; }
     return r;
@@ -113,12 +115,21 @@ export function createPersistentServerStore(db, ns = "server-channels", { onFata
     let n = 0;
     for (const r of db.prepare("SELECT seq, at, method, args FROM store_journal WHERE ns = ? ORDER BY seq").iterate(ns)) pending.push(r);
     for (const r of pending) {
-      frozen = r.at; globalThis.Date = FrozenDate;
-      try { await MemoryServerChannelStore.prototype[r.method].apply(store, dec(r.args)); n++; }
-      catch (e) { replayErrors.push({ seq: r.seq, method: r.method, error: e.message }); }
+      // R5-M2: the store's own clock is injected ({ now: clock }); upstream's remaining `new Date()` calls in mutating
+      // transitions all run synchronously before the method's first await. So the frozen Date is installed ONLY for
+      // that synchronous call and restored before we ever await: no other code (timers, sessions, ledger, expiry
+      // checks) can run while it is installed.
+      let p; frozen = r.at; globalThis.Date = FrozenDate;
+      try { p = MemoryServerChannelStore.prototype[r.method].apply(store, dec(r.args)); }
+      catch (e) { p = Promise.reject(e); }
       finally { frozen = null; globalThis.Date = RealDate; }
+      try { await p; n++; } catch (e) { replayErrors.push({ seq: r.seq, method: r.method, error: e.message }); }
     }
     pending.length = 0; replaying = false;
+    // R5-M3: any replay error = the rebuilt state may diverge from what upstream saw. Fail closed: mutating transitions
+    // refuse (so paid routes cannot proceed) until the operator reconciles and restarts with X402_ACK_REPLAY_ERRORS=1.
+    if (replayErrors.length && !ackReplayErrors) { store.replayFailed = replayErrors.slice();
+      console.error(`[x402-store] journal replay failed (${replayErrors.length} error(s)); refusing state transitions (fail closed). First: ${JSON.stringify(replayErrors[0])}`); }
     return { replayed: n, errors: replayErrors };
   })();
   // Open claim attempts after replay (H1 restart recovery input), incl. claimAmount for correct booking (N-M3).

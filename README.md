@@ -12,9 +12,9 @@ KasGate is a reverse proxy that puts pay-per-call [x402](https://www.x402.org/) 
 Requires Node.js 20+ and a local checkout of `kaspa-x402` (see *Dependencies* below).
 
 ```bash
-git clone https://github.com/elldeeone/kaspa-x402 ../upstream-x402   # path used by package.json
-npm install
-npm rebuild better-sqlite3   # needed if install ran with --ignore-scripts or the native build was skipped; otherwise ~20 tests fail
+./scripts/bootstrap.sh   # clones kaspa-x402 to ../upstream-x402 at the pinned commit and builds it, fetches the
+                         # rusty-kaspa WASM SDK v2.0.0 to ../vendor (sha256-checked; SKIP_SDK=1 to skip), then npm ci
+npm rebuild better-sqlite3   # only if install ran with --ignore-scripts or the native build was skipped; otherwise ~20 tests fail
 npm test            # unit + integration tests on the mock chain
 npm run demo        # upstream API + gateway + paying agent in one process
 ```
@@ -29,7 +29,7 @@ Real Testnet-10 (optional): `cp .env.example .env`, set `TN10_WALLET_KEY_FILE`, 
 
 ## Dependencies
 
-`package.json` points to the `@kaspa-x402/*` packages with `file:../upstream-x402/...` because they aren't on npm. Clone upstream next to this repo, or change the paths.
+`package.json` points to the `@kaspa-x402/*` packages with `file:../upstream-x402/...` because they aren't on npm, so a plain `npm ci` in a fresh clone fails. `scripts/bootstrap.sh` sets everything up (upstream commit `8d575de` = kaspa-x402 1.0.1; override with `UPSTREAM_COMMIT`). The real-TN10 code needs the rusty-kaspa WASM SDK (nodejs build) at `../vendor/kaspa-wasm32-sdk/nodejs/kaspa` or at `KASPA_WASM_SDK`; without it the real-chain tests are skipped with a reason, and everything else runs.
 
 ---
 
@@ -57,13 +57,12 @@ test/gateway.test.mjs  node:test suite
 ## Setup
 Requires Node 20+.
 ```sh
-cd ../upstream-x402/protocol && npm ci && npm run build   # build upstream SDK packages
-cd ../../kasgate && npm install                             # links them via file: deps
+./scripts/bootstrap.sh   # see Dependencies above
 ```
 
 ## Run
 ```sh
-npm test            # 73 tests (72 pass, 1 live test skipped)
+npm test            # 83 tests (82 pass, 1 live test skipped)
 npm run demo        # upstream + gateway + agent in one process
 # or run as separate services:
 npm run upstream    # :8500
@@ -202,21 +201,36 @@ failover (whichever node answers is trusted). This is *not* agreement between no
 | Setting | Effect |
 |---|---|
 | (none) | single source over `pnnEndpoints` (default) |
-| `pnnTrust: { mode: single, endpoints: [...] }` | explicit single source (e.g. your own node `ws://127.0.0.1:17210/...`) |
-| `pnnTrust: { mode: quorum, authorities: [{ trustDomain, endpoints }], required: 2 }` | upstream corroboration: every responding authority must agree; **depth = minimum `confirmationCount` across authorities** (gateway wrapper `withMinDepth`) |
+| `pnnTrust: { mode: single, endpoints: [...] }` | explicit single source (e.g. your own node `ws://127.0.0.1:18210`: wRPC **JSON**, testnet port 18210; 17210 is Borsh) |
+| `pnnTrust: { mode: quorum, authorities: [{ trustDomain, endpoints }], required: 2 }` | upstream corroboration: every responding authority must agree; **depth = minimum `confirmationCount` across authorities**, and at least `required` authorities must answer the depth re-check or the call fails closed; covenant lineage depth (batch) is wrapped the same way (`withMinDepth`) |
 | env `X402_PNN_DEFAULT_QUORUM=1` | with no `pnnTrust`, use a 2-of-N quorum over `pnnEndpoints`, one authority per hostname |
+
+**Running your own TN10 node.** kaspad serves wRPC only when asked: `kaspad --testnet --netsuffix=10 --utxoindex --rpclisten-json=default`
+(loopback `ws://127.0.0.1:18210`) or `--rpclisten-json=0.0.0.0:18210` behind a TLS reverse proxy for a public `wss://` endpoint.
+`--utxoindex` is required. The gateway accepts plain `ws://` only on loopback.
 
 Caveat: the two default TN10 endpoints are both run by kaspa.blue, so a quorum over them is ONE operator in practice
 (R3-M2, open). Mainnet needs your own node plus independent operators.
 
-**`exactFinality`** (`accepted` default | `confirmed`). In `confirmed` mode the gateway first checks that the node can
-serve evidence (preflight) *before* the payment is broadcast. If it can't, the payer gets `503 depth_verification_unavailable`
+**`exactFinality`** (`accepted` default | `confirmed`). In `confirmed` mode the gateway first proves the node(s) can
+serve depth evidence *before* the payment is broadcast: it re-proves a known deep tx at the required confirmations
+(`depthProbeTxid`, or the latest exact payment it delivered more than 60 s ago). With no probe tx, or if the proof fails, it fails closed. If it can't, the payer gets `503 depth_verification_unavailable`
 and nothing is broadcast. If the tx is broadcast but depth can't be proven within the in-request replays, the payment is
 held as **pending** (SQLite `kv` ns `exact-pending`, shown on the dashboard as `pendingExact`) and the payer gets
 `503 payment_pending` with the txid. Retrying the **same** payment delivers the data; it is never charged twice.
+Pending payments expire after `exactPendingTtlMs` (default 10 min) into a refund-due queue (SQLite ns `exact-refund-due`,
+dashboard `refundsDue`, ledger `pending-expired`); retries then get `410 payment_expired_refund_due`. Refunds are
+operator-approved: send it from your TN10 wallet, then record it with `x402-gateway refunds --txid <paid tx> --refund-tx <refund tx>`
+(`x402-gateway refunds` lists the queue).
 
 **`batch.openChargeSompi`.** The call that opens a batch channel is charged at least this amount (real-chain default:
-`settlement.minClaimNetSompi` + claim fee), so every channel is claimable from its first call. Later calls on the channel pay the route price.
+`settlement.minClaimNetSompi` + claim fee), so every channel is claimable from its first call. It must be >= `minClaimNetSompi` + claim fee (startup refuses less).
+The 402 challenge, the paid price and the per-IP cap use ONE rule: a channel is "below minimum" until its cumulative
+charge reaches the threshold recorded when its open charge was paid (a later fee/minimum change never re-charges it).
+Later calls on the channel pay the route price.
+**Journal replay** restores payment state on start. If any journal row fails to replay, the gateway fails closed: paid
+routes answer `503 gateway_state_unavailable` and state transitions are refused until you reconcile and restart with
+`X402_ACK_REPLAY_ERRORS=1` (errors are shown on the dashboard as `replayErrors`).
 
 ## Hardening
 
@@ -234,7 +248,7 @@ The internal review notes are not published. The operator-visible changes:
 - **Depth-gated (confirmation) mode is off by default.** The x402 payment authorization expires after about 60 s, which is before public TN10 nodes can prove the required confirmation depth. Retries return `payment_pending` and never charge twice, but they don't deliver data reliably. `config/routes-weather-confirmed.yaml` is experimental.
 - **Single node and quorum.** By default verification trusts one REST/wRPC endpoint. Quorum mode (`X402_PNN_DEFAULT_QUORUM`) takes the minimum depth across nodes, but the nodes are only as independent as their operators. Exact settlement at depth 0 relies on that node.
 - **Per-IP cap (low severity).** Sub-minimum batch channels are capped per client IP. Rotating IPs, NAT or proxies can get around it, or cause false limits. Run it behind a trusted proxy setup.
-- **Batch upfront charge** (narrows the free-below-claim-minimum gap) has been **tested on the mock chain only** and not yet in a live TN10 run. Any call on a channel whose recorded charge is still below the claim minimum (e.g. after a failed open) pays the open charge again, priced from server state. The per-IP open counter (`pendingOpens`) is per process, IPv4-mapped/NAT64 addresses can collide in `ipKey`, and `batch-open-ip` rows are never pruned (O(n) scan per open).
+- **Batch upfront charge** (narrows the free-below-claim-minimum gap) has been **tested on the mock chain only** and not yet in a live TN10 run. Any call on a channel whose recorded charge is still below the claim minimum (e.g. after a failed open) pays the open charge again, priced from server state. After a claim, new unclaimed value on a channel below the claim minimum is **accepted** (not counted by the per-IP cap) and is booked as `accepted-loss` if it is still unclaimable at the refund window: at most minimum + claim fee − route price per channel per claim cycle, borne by the seller. The per-IP open counter (`pendingOpens`) is per process, IPv4-mapped/NAT64 addresses can collide in `ipKey`, and `batch-open-ip` rows are never pruned (O(n) scan per open).
 - **Stuck-claim recovery is retry-only** (no reconcile/abandon). A channel can stay frozen until the payer refunds.
 - **Batch fees are a flat 0.02 KAS** for open/claim/refund, not mass × feerate.
 - **Batch handler durability/idempotency after a crash is not proven.**
@@ -242,9 +256,10 @@ The internal review notes are not published. The operator-visible changes:
 - **TN10 storage-mass standard limit is unverified** (500k default assumed).
 - **Config is hard-locked to TN10.** Mainnet would need code changes plus a fresh audit, not just new nodes.
 - **Verify-then-double-spend window:** a payer can try to double-spend while the origin is being fetched.
-- **One dissenting authority halts settlement** in quorum mode, and **transactions are submitted to a single node**.
+- **Depth-gated preflight, pending expiry, quorum fail-closed and the lineage wrapper are unit-tested only** (mock chain), never run live. A depth proof of an older tx does not guarantee the new tx will verify at depth; a held payment may still expire into the refund queue.
+- **One dissenting (or silent) authority halts settlement** in quorum mode, and **transactions are submitted to a single node**.
 - **Exact payments are served at depth 0** (`accepted`): a reorg after delivery is not handled, and the merchant bears that loss.
-- No KMS or HSM. Keys are 0600 files on local disk, and upstream batch-recovery JSON files also contain keys.
+- **Keys are unencrypted at rest.** No KMS or HSM: wallet and channel keys are plaintext 0600 files under `.secrets/` (0700), and upstream batch-recovery snapshots (`persistBatchRecoveryRecord`) write the live channel private key in plaintext JSON. Anyone who can read that disk can spend those funds. Must move to an encrypted keystore before any mainnet use.
 - The `Dockerfile` has never been built or tested.
 
 See `SECURITY.md` to report issues.

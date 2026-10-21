@@ -3,6 +3,7 @@
 //   x402-gateway serve [--config config/routes.yaml] [--db data/gateway.sqlite] [--chain mock|real] [--port N] [--host H]
 //   x402-gateway hash-password            # reads the password from stdin, prints an scrypt hash for X402_DASHBOARD_PASSWORD_HASH
 //   x402-gateway check-config --config F  # validate a routes file
+//   x402-gateway refunds [--db F] [--txid T --refund-tx R]  # list expired pending payments due a refund / record a refund you sent
 import { parseArgs } from "node:util";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,7 +15,7 @@ const { values: a } = parseArgs({ args: rest, options: {
   config: { type: "string", default: process.env.X402_CONFIG ?? path.join(ROOT, "config/routes.yaml") },
   db: { type: "string", default: process.env.X402_DB ?? path.join(ROOT, "data/gateway.sqlite") },
   chain: { type: "string", default: process.env.X402_CHAIN ?? "mock" },
-  port: { type: "string" }, host: { type: "string" } }, allowPositionals: false });
+  port: { type: "string" }, host: { type: "string" }, txid: { type: "string" }, "refund-tx": { type: "string" } }, allowPositionals: false });
 
 async function readStdin() { const c = []; for await (const x of process.stdin) c.push(x); return Buffer.concat(c).toString("utf8").replace(/\r?\n$/, ""); }
 
@@ -44,6 +45,17 @@ if (cmd === "hash-password") {
   const rec = await gw.recovered; if (rec.length) console.log(`[x402] claim recovery on start: ${JSON.stringify(rec)}`);
   console.log(`x402 gateway (TN10, ${a.chain.toUpperCase()} chain, db ${a.db}) on http://${cfg.listen.host}:${cfg.listen.port} -> ${cfg.upstream}`);
   const stop = () => { gw.close(); db.close(); process.exit(0); }; process.on("SIGINT", stop); process.on("SIGTERM", stop);
+} else if (cmd === "refunds") {
+  // R5-L3 refund path (operator-approved): the gateway moves pending payments past exactPendingTtlMs to 'exact-refund-due'.
+  // Send the refund yourself (TN10 wallet), then record its txid here. Nothing is broadcast by this command.
+  const { openDb } = await import("../src/store.mjs"); const db = openDb(a.db);
+  if (a.txid) { const row = db.prepare("SELECT v FROM kv WHERE ns='exact-refund-due' AND k=?").get(a.txid.toLowerCase());
+    if (!row) { console.error(`no refund-due entry for ${a.txid}`); process.exit(1); }
+    if (!/^[0-9a-f]{64}$/i.test(a["refund-tx"] ?? "")) { console.error("--refund-tx <64-hex txid> required"); process.exit(2); }
+    db.prepare("UPDATE kv SET v=? WHERE ns='exact-refund-due' AND k=?").run(JSON.stringify({ ...JSON.parse(row.v), status: "refunded", refundTxid: a["refund-tx"].toLowerCase(), refundedAt: new Date().toISOString() }), a.txid.toLowerCase());
+    console.log(`recorded refund ${a["refund-tx"]} for ${a.txid}`); }
+  for (const r of db.prepare("SELECT k, v FROM kv WHERE ns='exact-refund-due'").all()) console.log(JSON.stringify({ txid: r.k, ...JSON.parse(r.v) }));
+  db.close();
 } else {
-  console.error("usage: x402-gateway <serve|hash-password|check-config> [--config F] [--db F] [--chain mock|real] [--port N] [--host H]"); process.exit(2);
+  console.error("usage: x402-gateway <serve|hash-password|check-config|refunds> [--config F] [--db F] [--chain mock|real] [--port N] [--host H]"); process.exit(2);
 }
