@@ -121,3 +121,22 @@ test("R3-M3 (live shape): after the broadcast, re-verification at depth answers 
     assert.deepEqual(a.gw.pendingExact(), []);
   } finally { DirectModeServer.prototype.handlePaidRequest = orig; }
 });
+
+test("R4-M3: a channel left at charged 0 (failed open) pays the open charge again; the price comes from server state, not the client's accepted.amount", async () => {
+  const U = await up(); const db = tmpDb(), world = createMockBatchWorld();
+  const cfg = validateConfig({ ...raw(), upstream: U, settlement: { minClaimNetSompi: "1000000" }, batch: { ...raw().batch, openChargeSompi: "3000000" } });
+  const a = await start(cfg, { mockWorld: world, db, refundTimeoutDaa: "5000" });
+  const w = batchWallet(world, a.base, { batch: { maxDepositSompi: "20000000", allowedResources: [`${O}/weather/brisbane`], allowedServerPublicKeys: [world.serverPublicKey], minRefundLeadDaa: "1" } });
+  assert.equal((await w.fetch(`${O}/weather/brisbane`)).response.status, 200);
+  const [c] = await a.gw.store.listChannels(); const id = String(c.channelId ?? c.id).toLowerCase();
+  const { DirectModeServer } = await import("@kaspa-x402/server"); const orig = DirectModeServer.prototype.handlePaidRequest; const seen = [];
+  DirectModeServer.prototype.handlePaidRequest = async function (req) { seen.push(req.paymentAmount); return { status: 402, headers: {}, body: { error: "spy" } }; };
+  const hdr = (amount) => ({ "payment-signature": Buffer.from(JSON.stringify({ x402Version: 2, accepted: { amount }, payload: { channelId: id } })).toString("base64") });
+  try {
+    await fetch(`${a.base}/weather/brisbane`, { headers: hdr("3000000") }); // healthy channel: client claims the open price
+    const reloaded = await a.gw.store.loadChannel(id); // simulate a failed open: same channel, active, charged 0
+    a.gw.store.loadChannel = async (x) => (String(x).toLowerCase() === id ? { ...reloaded, chargedCumulativeAmount: "0" } : null);
+    await fetch(`${a.base}/weather/brisbane`, { headers: hdr("50000") }); // unfunded channel: client asks for the route price
+  } finally { DirectModeServer.prototype.handlePaidRequest = orig; }
+  assert.deepEqual(seen, ["50000", "3000000"], "healthy channel pays route price whatever the header says; charged-0 channel pays the open charge");
+});

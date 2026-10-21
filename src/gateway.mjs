@@ -403,8 +403,13 @@ export function createGateway(cfg, { ledgerPath = null, db = null, passwordHash 
           signed = p?.accepted?.amount ?? null;
           id = p?.payload?.channelId ?? p?.payload?.voucher?.channelId ?? p?.payload?.channel?.id ?? null; } catch {}
         id = id ? String(id).toLowerCase() : `unknown:${randomUUID()}`;
-        const isNew = !(await store.loadChannel(id));
-        if (openPrice) payAmount = isNew ? openPrice : (signed === openPrice ? openPrice : route.priceSompi);
+        const known = await store.loadChannel(id);
+        const isNew = !known;
+        // R4-M3: price from SERVER state, never the client's accepted.amount. A channel whose open failed (charged 0) or
+        // that is otherwise still below the claim minimum pays the open charge again until it is claimable.
+        if (openPrice) { const net = isNew ? 0n : BigInt(known.chargedCumulativeAmount ?? 0);
+          payAmount = isNew || net < minNet + claimFee ? openPrice : route.priceSompi; }
+        void signed;
         if (isNew && db && (maxSubMinPerIp != null || openPrice)) {
           const ipk = batchIpk;
           if (maxSubMinPerIp != null) { const sub = (pendingOpens.get(ipk) ?? 0) + (await ipChannels(ipk)).sub;

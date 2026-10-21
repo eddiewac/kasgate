@@ -14,6 +14,7 @@ Requires Node.js 20+ and a local checkout of `kaspa-x402` (see *Dependencies* be
 ```bash
 git clone https://github.com/elldeeone/kaspa-x402 ../upstream-x402   # path used by package.json
 npm install
+npm rebuild better-sqlite3   # needed if install ran with --ignore-scripts or the native build was skipped; otherwise ~20 tests fail
 npm test            # unit + integration tests on the mock chain
 npm run demo        # upstream API + gateway + paying agent in one process
 ```
@@ -57,12 +58,12 @@ test/gateway.test.mjs  node:test suite
 Requires Node 20+.
 ```sh
 cd ../upstream-x402/protocol && npm ci && npm run build   # build upstream SDK packages
-cd ../../x402-gateway && npm install                        # links them via file: deps
+cd ../../kasgate && npm install                             # links them via file: deps
 ```
 
 ## Run
 ```sh
-npm test            # 9 tests
+npm test            # 73 tests (72 pass, 1 live test skipped)
 npm run demo        # upstream + gateway + agent in one process
 # or run as separate services:
 npm run upstream    # :8500
@@ -217,13 +218,13 @@ held as **pending** (SQLite `kv` ns `exact-pending`, shown on the dashboard as `
 **`batch.openChargeSompi`.** The call that opens a batch channel is charged at least this amount (real-chain default:
 `settlement.minClaimNetSompi` + claim fee), so every channel is claimable from its first call. Later calls on the channel pay the route price.
 
-## Hardening (REVIEW.md → FIXES.md)
+## Hardening
 
-The full mapping is in `FIXES.md`. The operator-visible changes:
+The internal review notes are not published. The operator-visible changes:
 - **Dashboard auth:** use `X402_DASHBOARD_PASSWORD_HASH` (required for `--chain real`), or for mock/dev `X402_DASHBOARD_TOKEN` sent as `Authorization: Bearer …`. `?token=` and the old default token are refused.
 - **Batch config:** `batch.claimMarginDaa`, `batch.rotateEveryDaa`, `batch.acceptedFinality` (real default `confirmed`) and `batch.allowShortRefundTimeout` (needed when the delta is under 36,000 DAA on a real chain).
 - **Settlement config:** `settlement.minClaimNetSompi` (real default 0.11 TKAS, a storage-mass guard).
-- **Wallet caps:** `dailyCapSompi` counts exact payments + deposits/top-ups; `dailyVoucherCapSompi` caps voucher charges. Reservations with unknown outcome keep counting until `releaseReservation(id, { lookupTx })` proves them absent on-chain.
+- **Wallet caps:** `dailyCapSompi` counts exact payments + deposits/top-ups; `dailyVoucherCapSompi` caps voucher charges. Reservations with unknown outcome keep counting toward the cap. `releaseReservation(id, { lookupTx })` marks a tx that is absent on-chain as `absent-unspent`, which **still counts** until its inputs are proven spent elsewhere.
 - **Request handling:** `maxBodyBytes` (default 1 MiB) and `passRequestHeaders`.
 - **Crash recovery:** `node src/live/recover-live-batch.mjs [--refund]` restarts a live batch run from `data/live-batch.sqlite`.
 
@@ -233,8 +234,17 @@ The full mapping is in `FIXES.md`. The operator-visible changes:
 - **Depth-gated (confirmation) mode is off by default.** The x402 payment authorization expires after about 60 s, which is before public TN10 nodes can prove the required confirmation depth. Retries return `payment_pending` and never charge twice, but they don't deliver data reliably. `config/routes-weather-confirmed.yaml` is experimental.
 - **Single node and quorum.** By default verification trusts one REST/wRPC endpoint. Quorum mode (`X402_PNN_DEFAULT_QUORUM`) takes the minimum depth across nodes, but the nodes are only as independent as their operators. Exact settlement at depth 0 relies on that node.
 - **Per-IP cap (low severity).** Sub-minimum batch channels are capped per client IP. Rotating IPs, NAT or proxies can get around it, or cause false limits. Run it behind a trusted proxy setup.
-- **Batch upfront charge** (closes the free-below-claim-minimum gap) has been **tested on the mock chain only** and not yet in a live TN10 run.
-- No KMS or HSM. Keys are 0600 files on local disk.
+- **Batch upfront charge** (narrows the free-below-claim-minimum gap) has been **tested on the mock chain only** and not yet in a live TN10 run. Any call on a channel whose recorded charge is still below the claim minimum (e.g. after a failed open) pays the open charge again, priced from server state. The per-IP open counter (`pendingOpens`) is per process, IPv4-mapped/NAT64 addresses can collide in `ipKey`, and `batch-open-ip` rows are never pruned (O(n) scan per open).
+- **Stuck-claim recovery is retry-only** (no reconcile/abandon). A channel can stay frozen until the payer refunds.
+- **Batch fees are a flat 0.02 KAS** for open/claim/refund, not mass × feerate.
+- **Batch handler durability/idempotency after a crash is not proven.**
+- **The journal is never compacted**, so replay on restart grows without bound.
+- **TN10 storage-mass standard limit is unverified** (500k default assumed).
+- **Config is hard-locked to TN10.** Mainnet would need code changes plus a fresh audit, not just new nodes.
+- **Verify-then-double-spend window:** a payer can try to double-spend while the origin is being fetched.
+- **One dissenting authority halts settlement** in quorum mode, and **transactions are submitted to a single node**.
+- **Exact payments are served at depth 0** (`accepted`): a reorg after delivery is not handled, and the merchant bears that loss.
+- No KMS or HSM. Keys are 0600 files on local disk, and upstream batch-recovery JSON files also contain keys.
 - The `Dockerfile` has never been built or tested.
 
 See `SECURITY.md` to report issues.
