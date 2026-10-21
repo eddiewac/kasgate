@@ -1,0 +1,13 @@
+# Mock-mode batch-settlement example (kaspa-x402 runs batch on kaspa:testnet-10).
+network: kaspa:testnet-10
+publicOrigin: https://api.demo.test
+listen: { host: 127.0.0.1, port: 8402 }
+upstream: http://127.0.0.1:8500
+payTo: kaspatest:payout
+dashboard: { path: /_x402/dashboard }   # token: set X402_DASHBOARD_TOKEN (Bearer) or use X402_DASHBOARD_PASSWORD_HASH login
+# RR-H3: 24 h refund timeout, claim >= 1 h before it (real-chain policy enforces both; mock accepts the same values)
+batch: { minDepositSompi: "4000000", claimReserveSompi: "2000000", refundTimeoutDeltaDaa: "864000", claimMarginDaa: "36000" }
+settlement: { minClaimSompi: "20000000", claimEveryMinutes: 1440 }   # incentive audit: claim at >= 0.2 KAS or every 24 h
+routes:
+  - { match: "GET /weather/*", scheme: batch-settlement, priceSompi: "50000" }   # 0.0005 KAS per call
+  - { match: "GET /premium/*", scheme: exact, priceSompi: "100000000" }          # exact, 1 KAS

@@ -1,0 +1,18 @@
+# Real-data demo: x402 gateway in front of the Open-Meteo weather adapter (src/weather-upstream.mjs).
+# TESTNET-10 ONLY. Exact scheme, real TN10 settlement (test funds), verified against a TN10 node (wRPC).
+network: kaspa:testnet-10
+publicOrigin: https://api.demo.test
+listen: { host: 127.0.0.1, port: 8403 }
+upstream: http://127.0.0.1:8501
+payTo: kaspatest:YOUR_MERCHANT_ADDRESS   # demo merchant (TN10)
+dashboard: { path: /_x402/dashboard }
+exactFinality: confirmed
+confirmations: 100            # selected-chain confirmations before an exact payment is accepted (P0-4)
+pnnEndpoints: [ "wss://muon-10.kaspa.blue/kaspa/testnet-10/wrpc/json", "wss://electron-10.kaspa.blue/kaspa/testnet-10/wrpc/json" ]
+routes:
+  - match: "GET /weather/*"
+    scheme: exact
+    priceSompi: "100000000"    # 1 TKAS: incentive-audit exact minimum (at 0.1 KAS the TN10 fee is ~100% of the price)
+    description: Current weather (Open-Meteo, CC BY 4.0)
+  - match: "GET /health"
+    free: true

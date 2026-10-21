@@ -1,0 +1,6058 @@
+// PORTED FROM elldeeone/kaspa-x402 @ 8d575de113c9cbe07ea45c9eb94514fe3307c801
+//   protocol/scripts/live-adapter-reference.mjs (MIT License, see ./LICENSE).
+// Changes: REPO_ROOT points at this directory (vendored vectors/tx-v1 compute fixtures);
+// appended createLiveKit() factory (bottom) that extracts the adapter wiring from runLiveProof()
+// without the funding split, KIP-10 heads or proof flows. All transaction building, signing,
+// covenant verification and chain-evidence logic is upstream's, unchanged.
+// TESTNET-10 ONLY.
+import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+
+import {
+  DirectModeClient,
+  MemoryChannelStore,
+  PAYMENT_REQUIRED_HEADER,
+  PAYMENT_RESPONSE_HEADER,
+  PAYMENT_SIGNATURE_HEADER,
+} from "@kaspa-x402/client";
+import {
+  applyCovenantSelectedChainUpdate,
+  bytesToHex,
+  decodePaymentRequiredHeader,
+  decodePaymentResponseHeader,
+  encodePaymentRequiredHeader,
+  encodePaymentSignatureHeader,
+  exactRequestAuthorizationDigest,
+  exactRequestAuthorizationId,
+  hexToBytes,
+  readKaspaSettlementExtension,
+  sha256Hex,
+  stableStringify,
+  voucherDigest,
+} from "@kaspa-x402/core";
+import {
+  buildBatchClaimTxV1Artifact,
+  buildBatchGenesisTxV1Artifact,
+  buildBatchRefundTxV1Artifact,
+  buildBatchTopUpTxV1Artifact,
+  buildEscrowRedeemScript,
+  buildKip10AdditiveBorrowArgs,
+  buildKip10AdditiveRedeemScript,
+  KIP10_ADDITIVE_TEMPLATE_ID,
+  KIP10_EXACT_TRANSACTION_ENCODING,
+  TX_V1_P2PK_COMPUTE_BUDGET,
+  escrowScriptPublicKey,
+  kip10AdditiveScriptPublicKey,
+  scriptUnitAllowance,
+  serializedScriptPublicKey,
+  transactionV1CovenantId,
+} from "@kaspa-x402/covenant";
+import {
+  DirectModeServer,
+  MemoryChannelLockManager,
+  MemoryServerChannelStore,
+} from "@kaspa-x402/server";
+import { sanitizeProofOutputText } from "./proof-output-security.mjs";
+import { transactionInputOutpoint } from "./transaction-input-outpoint.mjs";
+import { proofFeeSompi } from "./live-proof-fees.mjs";
+
+// Reference adapter for scripts/proof-live-testnet.mjs. It is testnet-only,
+// spends testnet funds, and writes local signing/recovery material under
+// KASPA_X402_DATA_DIR. Keep that directory out of source control.
+const NATIVE_SUBNETWORK_ID = "00".repeat(20);
+const DEFAULT_CONFIRMATION_TIMEOUT_MS = 120_000;
+const LIVE_ADAPTER_TIMEOUT_MS = DEFAULT_CONFIRMATION_TIMEOUT_MS + 15_000;
+// [gateway port] P0-4: configurable via createLiveKit({ confirmations }) (default 100; upstream constant is 30).
+let CONFIRMATION_THRESHOLD = 100;
+const MAX_SELECTED_CHAIN_PAGES = 32;
+const MAX_SELECTED_CHAIN_BLOCKS = 32_768;
+const EXACT_AMOUNT = "100000000";
+const EXACT_TINY_AMOUNT = "10000000";
+const EXACT_KIP10_HEAD_AMOUNT = "100000000";
+const EXACT_KIP10_ADDITIVE_THRESHOLD = "10000000";
+const EXACT_KIP10_COMPUTE_BUDGET = 10;
+const P2PK_COMPUTE_BUDGET = 10;
+const BATCH_REQUEST_AMOUNT = "100000000";
+const BATCH_SECOND_CLAIM_AMOUNT = BigInt(BATCH_REQUEST_AMOUNT) / 2n;
+// Keep a 0.1 KAS payout in the smallest claim; this is a proof scenario limit.
+const BATCH_MIN_PAYOUT_AMOUNT = 10_000_000n;
+const DEFAULT_FEE_SOMPI = proofFeeSompi(
+  "KASPA_X402_PROOF_FEE_SOMPI",
+  "2000000",
+  BATCH_SECOND_CLAIM_AMOUNT - BATCH_MIN_PAYOUT_AMOUNT,
+);
+const BATCH_DEPOSIT_AMOUNT = "400000000";
+const BATCH_TOP_UP_REQUEST_AMOUNT = "298000000";
+const FUNDING_SPLIT_SHARDS = 16;
+const MIN_REUSABLE_FUNDING_SHARDS = 8;
+const FUNDING_SPLIT_SHARD_AMOUNT = 500_000_000n;
+const SDK_GENERATED_TX_VERSION_SOURCE = "sdk-generated-transaction";
+const LIVE_LOOPBACK_ADMISSION_KEY = sha256Hex("kaspa-x402-live-proof-loopback:v1");
+const ADAPTER_SUBMITTED_TX_VERSION_SOURCE =
+  "adapter-submitted-transaction-shape";
+const REPO_ROOT = path.dirname(fileURLToPath(import.meta.url));
+
+export async function runLiveProof(context) {
+  // Resolve every required compute fixture before loading credentials or
+  // funding anything. Isolated consumer bundles must include these inputs.
+  for (const operation of ["claim", "top-up", "refund"]) batchComputeProfile(operation);
+  const sdkPath = process.env.KASPA_X402_KASPA_WASM_MODULE;
+  if (!sdkPath)
+    throw new Error(
+      "KASPA_X402_KASPA_WASM_MODULE is required by the reference live adapter",
+    );
+
+  const absoluteSdkPath = path.resolve(sdkPath);
+  const sdkRequire = createRequire(
+    fs.statSync(absoluteSdkPath).isDirectory()
+      ? path.join(absoluteSdkPath, "kaspa.js")
+      : absoluteSdkPath,
+  );
+  globalThis.WebSocket = sdkRequire("websocket").w3cwebsocket;
+  const sdk = sdkRequire(absoluteSdkPath);
+  const { schnorr } = sdkRequire("@noble/curves/secp256k1.js");
+  sdk.initConsolePanicHook?.();
+
+  const networkId = kaspaNetworkId(context.network);
+  const dataDir = path.resolve(context.dataDir);
+  fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+
+  const fundingPrivateKeyHex = loadFundingPrivateKey(context.fundingWallet);
+  const fundingPrivateKey = new sdk.PrivateKey(fundingPrivateKeyHex);
+  const fundingAddress = fundingPrivateKey.toAddress(networkId).toString();
+  const fundingPublicKey = bytesToHex(
+    schnorr.getPublicKey(
+      hexToBytes(fundingPrivateKeyHex, { expectedLength: 32 }),
+    ),
+  );
+  const serverChannelKey = loadOrCreateChannelKey(
+    path.join(dataDir, "server-channel-key"),
+    schnorr,
+  );
+  const serverPayoutKey = loadOrCreateWalletKey(
+    path.join(dataDir, "server-payout-key"),
+    sdk,
+  );
+  const serverPayoutAddress = serverPayoutKey.toAddress(networkId).toString();
+
+  const rpc = new sdk.RpcClient({ url: context.rpcUrl, networkId });
+  const pendingBroadcasts = new Map();
+  const knownUtxos = new Map();
+  const spentOutpoints = new Set();
+  const fundingVersionByTxid = new Map();
+  const batchArtifactsByTxid = new Map();
+  const batchGenesisByOutpoint = new Map();
+  const batchTopUpsByOutpoint = new Map();
+  const batchRecovery = {};
+  loadPersistedBatchArtifacts({
+    dataDir,
+    sdk,
+    networkId,
+    batchArtifactsByTxid,
+    batchGenesisByOutpoint,
+    batchTopUpsByOutpoint,
+  });
+  try {
+    await rpc.connect({ timeoutDuration: 15_000, retries: 2 });
+    const serverInfo = await rpc.getServerInfo();
+    if (String(serverInfo.networkId) !== "testnet-10")
+      throw new Error(
+        `configured live-proof node reports ${String(serverInfo.networkId)} instead of testnet-10`,
+      );
+    if (!serverInfo.isSynced)
+      throw new Error("configured testnet node reports unsynced");
+    if (!serverInfo.hasUtxoIndex)
+      throw new Error("configured testnet node does not expose UTXO index");
+
+    const timeoutDelta = positiveBigInt(context.timeoutDaa, "timeoutDaa");
+    const initialRefundTimeoutDaa = (
+      BigInt(serverInfo.virtualDaaScore) + timeoutDelta
+    ).toString();
+    const addressCodec = makeAddressCodec(sdk, networkId);
+    const chain = makeChainProvider({
+      rpc,
+      sdk,
+      addressCodec,
+      networkId,
+      network: context.network,
+      pendingBroadcasts,
+      knownUtxos,
+      spentOutpoints,
+      dataDir,
+      batchArtifactsByTxid,
+      batchGenesisByOutpoint,
+      batchRecovery,
+      redactionSecrets: [context.rpcUrl, context.fundingWallet],
+    });
+    const fundingProvider = makeFundingProvider({
+      rpc,
+      sdk,
+      addressCodec,
+      chain,
+      networkId,
+      network: context.network,
+      fundingPrivateKey,
+      fundingPrivateKeyHex,
+      providerPrivateKeyHex: serverChannelKey.privateKey,
+      fundingAddress,
+      fundingPublicKey,
+      schnorr,
+      pendingBroadcasts,
+      knownUtxos,
+      spentOutpoints,
+      fundingVersionByTxid,
+      batchArtifactsByTxid,
+      batchGenesisByOutpoint,
+      batchTopUpsByOutpoint,
+      dataDir,
+    });
+    const signer = makeSigner({
+      schnorr,
+      fundingPrivateKeyHex,
+      fundingPublicKey,
+      dataDir,
+    });
+    const serverStore = new MemoryServerChannelStore();
+    const serverLockManager = new MemoryChannelLockManager();
+    const clientStore = new MemoryChannelStore();
+    batchRecovery.serverStore = serverStore;
+    batchRecovery.clientStore = clientStore;
+    const voucherVerifier = {
+      verifyVoucher({ digest, voucher, clientPublicKey }) {
+        return schnorr.verify(
+          hexToBytes(voucher.signature, { expectedLength: 64 }),
+          hexToBytes(digest, { expectedLength: 32 }),
+          hexToBytes(clientPublicKey, { expectedLength: 32 }),
+        );
+      },
+    };
+    const batchPresentationVerifier = {
+      verifyPresentation({ digest, signature, clientPublicKey }) {
+        return schnorr.verify(
+          hexToBytes(signature, { expectedLength: 64 }),
+          hexToBytes(digest, { expectedLength: 32 }),
+          hexToBytes(clientPublicKey, { expectedLength: 32 }),
+        );
+      },
+    };
+    const exactTransactionVerifier = {
+      async verifyExactPayment(request) {
+        return verifyExactTransaction({
+          sdk,
+          schnorr,
+          transactionArtifact: request.transaction,
+          request,
+          fundingAddress,
+          fundingPublicKey,
+        });
+      },
+    };
+    const fundingSplit = await createFundingSplit({
+      rpc,
+      sdk,
+      networkId,
+      fundingPrivateKey,
+      fundingAddress,
+      spentOutpoints,
+    });
+    const externalHeadProofs = new Map();
+    const exactSettlementReconciler = makeExactSettlementReconciler({
+      rpc,
+      paymentAddress: serverPayoutAddress,
+    });
+    const exactHeadReconciler = makeExactHeadReconciler({
+      rpc,
+      sdk,
+      externalHeadProofs,
+    });
+    const baseServerConfig = {
+      network: context.network,
+      payTo: serverPayoutAddress,
+      amount: EXACT_AMOUNT,
+      chainProvider: chain,
+      lockManager: serverLockManager,
+      addressCodec,
+      exactTransactionVerifier,
+      exactSettlementReconciler,
+      acceptedFinality: "accepted",
+      confirmationThreshold: CONFIRMATION_THRESHOLD,
+      publicBoundaryPolicy: {
+        adapterTimeoutMs: LIVE_ADAPTER_TIMEOUT_MS,
+      },
+    };
+    const batchConfig = {
+      serverPublicKey: serverChannelKey.publicKey,
+      minDepositSompi: BATCH_DEPOSIT_AMOUNT,
+      claimReserveSompi: DEFAULT_FEE_SOMPI.toString(),
+      refundTimeoutDaa: initialRefundTimeoutDaa,
+      voucherVerifier,
+      batchPresentationVerifier,
+      topUpVerifier: {
+        verifyTopUp(request) {
+          return verifyPersistedBatchTopUp(batchTopUpsByOutpoint, request);
+        },
+      },
+    };
+    const claimBuilder = {
+      async buildClaimTransaction({ channel, claimAmount }) {
+        return buildPreparedClaim({
+          channel,
+          claimAmount,
+          rpc,
+          sdk,
+          networkId,
+          serverPrivateKeyHex: serverChannelKey.privateKey,
+          addressCodec,
+          pendingBroadcasts,
+          knownUtxos,
+          spentOutpoints,
+          batchArtifactsByTxid,
+          dataDir,
+          schnorr,
+        });
+      },
+    };
+    const standardServer = new DirectModeServer({
+      ...baseServerConfig,
+      store: serverStore,
+      exactProfile: "standard-native",
+    });
+    const additiveHeads = [];
+    for (let index = 0; index < 2; index += 1) {
+      additiveHeads.push(
+        await createKip10Head({
+          rpc,
+          sdk,
+          addressCodec,
+          network: context.network,
+          fundingPrivateKey,
+          fundingAddress,
+          fundingPublicKey,
+          knownUtxos,
+          spentOutpoints,
+        }),
+      );
+    }
+    for (const additiveHead of additiveHeads) {
+      await serverStore.registerExactHead(additiveHead.record);
+    }
+    const additiveServer = new DirectModeServer({
+      ...baseServerConfig,
+      payTo: additiveHeads[0].record.payTo,
+      store: serverStore,
+      exactProfile: "additive",
+      exactHeadReconciler,
+    });
+    const client = new DirectModeClient({
+      addressCodec,
+      fundingProvider,
+      store: clientStore,
+      fundingPolicy: {
+        requiredSource: "hot-wallet",
+        allowedOrigins: ["https://live.kaspa-x402.local"],
+        allowedExactProfiles: ["standard-native", "additive"],
+        allowedPayTo: [serverPayoutAddress, additiveHeads[0].record.payTo],
+        maximumExactAmountSompi: EXACT_AMOUNT,
+        batchPayment: {
+          maximumBatchChargeSompi: (BigInt(BATCH_DEPOSIT_AMOUNT) * 2n).toString(),
+          maximumInitialDepositSompi: BATCH_DEPOSIT_AMOUNT,
+          maximumTopUpSompi: (BigInt(BATCH_DEPOSIT_AMOUNT) * 2n).toString(),
+          maximumCumulativeAuthorizationSompi: (BigInt(BATCH_DEPOSIT_AMOUNT) * 10n).toString(),
+          maximumTotalExposureSompi: (BigInt(BATCH_DEPOSIT_AMOUNT) * 12n).toString(),
+          minimumRefundLeadDaa: "1",
+          maximumRefundHorizonDaa: (timeoutDelta + 1n).toString(),
+          allowedOrigins: ["https://live.kaspa-x402.local"],
+          allowedResources: ["https://live.kaspa-x402.local/batch/first"],
+          allowedPayTo: [serverPayoutAddress],
+          allowedServerPublicKeys: [serverChannelKey.publicKey],
+          allowedFundingSources: ["hot-wallet"],
+        },
+      },
+      supportedNetworks: [context.network],
+      confirmationThreshold: CONFIRMATION_THRESHOLD,
+      batch: {
+        signer,
+        refundAddress: fundingAddress,
+        refundBuilder: {
+          async buildRefundTransaction(request) {
+            return buildPreparedRefund({
+              ...request,
+              refundAddress: fundingAddress,
+              rpc,
+              sdk,
+              addressCodec,
+              pendingBroadcasts,
+              batchArtifactsByTxid,
+              dataDir,
+            });
+          },
+        },
+        refundReconciler: makeRefundReconciler({
+          rpc,
+          refundAddress: fundingAddress,
+          batchArtifactsByTxid,
+        }),
+        verifyVoucherSignature(voucher, channel) {
+          const digest = voucherDigest({
+            network: channel.config.network,
+            covenantId: channel.covenantId,
+            authorizedCumulativeAmount: voucher.authorizedCumulativeAmount,
+          });
+          return schnorr.verify(
+            hexToBytes(voucher.signature, { expectedLength: 64 }),
+            hexToBytes(digest, { expectedLength: 32 }),
+            hexToBytes(channel.clientPublicKey, { expectedLength: 32 }),
+          );
+        },
+      },
+    });
+
+    const report = {
+      node: {
+        rpcUrl: context.rpcUrl,
+        networkId: serverInfo.networkId,
+        virtualDaaScore: String(serverInfo.virtualDaaScore),
+      },
+      addresses: {
+        funding: fundingAddress,
+        serverPayout: serverPayoutAddress,
+        additiveHeads: additiveHeads.map((head) => head.record.payTo),
+      },
+      fundingSplit,
+      timeout: {
+        deltaDaa: timeoutDelta.toString(),
+        refundTimeoutDaa: initialRefundTimeoutDaa,
+      },
+    };
+    let flow = "hosted batch";
+    try {
+      const hostedBatchGateway = process.env.KASPA_X402_HOSTED_BATCH_GATEWAY_URL;
+      if (hostedBatchGateway) {
+        report.hostedBatch = await runHostedBatchCanary({
+          gatewayBase: hostedBatchGateway,
+          expected: hostedBatchExpectationsFromEnv(),
+          network: context.network,
+          fundingProvider,
+          signer,
+          addressCodec,
+          fundingAddress,
+          schnorr,
+          batchRecovery,
+          clientStore,
+        });
+      }
+      flow = "exact";
+      report.exact = {
+        standardNativeTiny: await runExact({
+          client,
+          server: standardServer,
+          profile: "standard-native",
+          amount: EXACT_TINY_AMOUNT,
+          label: "tiny",
+          sdk,
+          networkId,
+          schnorr,
+          fundingPrivateKeyHex,
+        }),
+        standardNative: await runExact({
+          client,
+          server: standardServer,
+          profile: "standard-native",
+          amount: EXACT_AMOUNT,
+          label: "normal",
+          sdk,
+          networkId,
+          schnorr,
+          fundingPrivateKeyHex,
+        }),
+        additive: await runExact({
+          client,
+          server: additiveServer,
+          profile: "additive",
+          amount: EXACT_AMOUNT,
+          label: "normal",
+          preferredHeadId: additiveHeads[0].record.headId,
+          sdk,
+          networkId,
+          schnorr,
+          fundingPrivateKeyHex,
+        }),
+        headFunding: additiveHeads[0].funding,
+        headFundings: additiveHeads.map((head) => head.funding),
+      };
+      report.exact.conflict = await runAdditiveConflict({
+        client,
+        server: additiveServer,
+        preferredHeadId: additiveHeads[1].record.headId,
+        sdk,
+        networkId,
+      });
+      report.exact.invalidSignature = await runInvalidExactSignature({
+        client,
+        server: standardServer,
+        pendingBroadcasts,
+      });
+      report.exact.expiredAuthorization = await runExpiredExactAuthorization({
+        client,
+        server: standardServer,
+        pendingBroadcasts,
+        sdk,
+        schnorr,
+        fundingPrivateKeyHex,
+      });
+      report.exact.recovery = await runExactRestartRecovery({
+        client,
+        baseServerConfig,
+        store: serverStore,
+        chain,
+      });
+      report.exact.externalAdvance = await runExternalHeadAdvance({
+        client,
+        server: additiveServer,
+        store: serverStore,
+        chain,
+        sdk,
+        preferredHeadId: additiveHeads[0].record.headId,
+        externalHeadProofs,
+      });
+      flow = "batch";
+      const batchStartDaaScore = BigInt(await chain.getVirtualDaaScore());
+      const refundTimeoutDaa = (batchStartDaaScore + timeoutDelta).toString();
+      report.timeout = {
+        deltaDaa: timeoutDelta.toString(),
+        batchStartDaaScore: batchStartDaaScore.toString(),
+        refundTimeoutDaa,
+      };
+      const batchServer = new DirectModeServer({
+        ...baseServerConfig,
+        store: serverStore,
+        exactProfile: "standard-native",
+        batch: {
+          ...batchConfig,
+          refundTimeoutDaa,
+          claimBuilder,
+        },
+      });
+      report.batch = await runBatch({
+        client,
+        server: batchServer,
+        serverStore,
+        clientStore,
+        rpc,
+        sdk,
+        networkId,
+        addressCodec,
+        serverPrivateKeyHex: serverChannelKey.privateKey,
+        fundingAddress,
+        pendingBroadcasts,
+        knownUtxos,
+        spentOutpoints,
+        fundingVersionByTxid,
+        fundingProvider,
+        batchArtifactsByTxid,
+        batchGenesisByOutpoint,
+        batchTopUpsByOutpoint,
+        batchRecovery,
+        dataDir,
+        timeoutDaa: BigInt(refundTimeoutDaa),
+      });
+    } catch (error) {
+      throw new Error(
+        `${flow} flow failed: ${error?.message ?? String(error)} ${JSON.stringify(error?.details ?? error?.cause ?? null)}`,
+      );
+    }
+    report.requiredFlowStatus = Object.fromEntries(
+      context.requiredFlows.map((flow) => [flow, "passed"]),
+    );
+    report.fundingBalanceAfterSompi = (
+      await balanceSompi(rpc, fundingAddress)
+    ).toString();
+    return report;
+  } finally {
+    try {
+      await rpc.disconnect();
+    } catch {
+      // best effort shutdown
+    }
+  }
+}
+
+async function runExact({
+  client,
+  server,
+  profile,
+  amount,
+  label,
+  preferredHeadId,
+  sdk,
+  networkId,
+  schnorr,
+  fundingPrivateKeyHex,
+}) {
+  const challenge = await exactChallenge({
+    server,
+    profile,
+    amount,
+    label,
+    preferredHeadId,
+  });
+  const { resource, paymentRequired } = challenge;
+  const payment = await client.createPayment(paymentRequired, {
+    url: resource.url,
+    paymentIdentifier: `live_exact_${profile}_${label}_0001`,
+  });
+  if (payment.paymentPayload.payload.type !== "exact-transaction") {
+    throw new Error(
+      `${profile} exact challenge produced ${payment.paymentPayload.payload.type} instead of exact-transaction`,
+    );
+  }
+  const requestHash = payment.paymentPayload.payload.requestHash;
+  if (!requestHash)
+    throw new Error("exact payment did not include a request hash");
+  const economics = exactTransactionEconomics({
+    sdk,
+    networkId,
+    transactionArtifact: payment.paymentPayload.payload.transaction,
+    profile,
+    amount,
+    headAmount: payment.paymentPayload.accepted.extra.headAmount,
+  });
+  let preBroadcastVerify;
+  try {
+    await server.verifyPayment({ routeAccess: "public",
+      resource,
+      paymentRequirements: payment.paymentPayload.accepted,
+      paymentPayload: payment.paymentPayload,
+      requestHash,
+    });
+    preBroadcastVerify = { result: "unexpected-pass" };
+  } catch (error) {
+    preBroadcastVerify = {
+      result: "rejected-before-observation",
+      code: error?.code,
+      message: error?.message ?? String(error),
+    };
+    if (error?.code !== "invalid_kaspa_transaction") {
+      throw new Error(
+        `${profile} exact pre-broadcast verification failed before the finality gate: ${error?.code ?? "error"} ${error?.message ?? String(error)}`,
+      );
+    }
+  }
+  let handlerExecutions = 0;
+  const handler = async () => {
+    handlerExecutions += 1;
+    return { status: 200, body: { ok: true, profile, label } };
+  };
+  const response = await server.handlePaidRequest(
+    requestWithPayment(payment.paymentPayload, { routeAccess: "public",
+      url: resource.url,
+      resource,
+      scheme: "exact",
+      amount,
+      requestHash,
+    }),
+    handler,
+  );
+  if (response.status !== 200) {
+    throw new Error(
+      `${profile} exact payment failed: ${JSON.stringify({ status: response.status, body: response.body, headers: response.headers })}`,
+    );
+  }
+  const settlement = decodeResponse(response);
+  const settlementExtra = requireSettlementExtension(settlement);
+  await client.applySettlement(payment, settlement);
+  const duplicate = await server.handlePaidRequest(
+    requestWithPayment(payment.paymentPayload, { routeAccess: "public",
+      url: resource.url,
+      resource,
+      scheme: "exact",
+      amount,
+      requestHash,
+    }),
+    handler,
+  );
+  if (duplicate.status !== 200 || handlerExecutions !== 1) {
+    throw new Error(
+      `${profile} exact duplicate was not idempotent: ${duplicate.status}/${handlerExecutions}`,
+    );
+  }
+  const replayRequestHash = hash({
+    flow: `exact-${profile}-${label}`,
+    request: 2,
+  });
+  const replayPayload = reauthorizeExactPayload({
+    paymentPayload: payment.paymentPayload,
+    transactionId: settlement.transaction,
+    requestHash: replayRequestHash,
+    paymentIdentifier: `${payment.paymentPayload.extensions["payment-identifier"].info.id}_replay`,
+    schnorr,
+    fundingPrivateKeyHex,
+  });
+  const replay = await server.handlePaidRequest(
+    requestWithPayment(replayPayload, { routeAccess: "public",
+      url: resource.url,
+      resource,
+      scheme: "exact",
+      amount,
+      requestHash: replayRequestHash,
+    }),
+    async () => ({
+      status: 200,
+      body: { ok: false },
+    }),
+  );
+  if (
+    replay.status !== 409 ||
+    replay.body?.error !== "invalid_transaction_state"
+  ) {
+    throw new Error(
+      `${profile} exact replay was not rejected: ${replay.status}`,
+    );
+  }
+  const accepted = payment.paymentPayload.accepted;
+  const headAmount = accepted.extra.headAmount;
+  const successorAmount =
+    profile === "additive" && headAmount
+      ? (BigInt(headAmount) + BigInt(amount)).toString()
+      : undefined;
+  return {
+    profile,
+    txid: settlement.transaction,
+    txVersion: profile === "additive" ? 1 : 0,
+    txVersionSource: ADAPTER_SUBMITTED_TX_VERSION_SOURCE,
+    outputIndex: settlementExtra.paymentOutputIndex,
+    amount: settlement.amount,
+    finality: settlementExtra.finality,
+    payloadEvidence: {
+      type: "exact-transaction",
+      profile,
+      transactionEncoding: payment.paymentPayload.payload.transactionEncoding,
+      transactionArtifactSha256: sha256Hex(
+        payment.paymentPayload.payload.transaction,
+      ),
+      paymentOutputIndex: payment.paymentPayload.payload.paymentOutputIndex,
+      ...(profile === "additive"
+        ? {
+            headId: accepted.extra.headId,
+            headVersion: accepted.extra.headVersion,
+            expectedHeadOutpoint: accepted.extra.expectedHeadOutpoint,
+            headAmount,
+            successorAmount,
+            exactDeltaSompi: (
+              BigInt(successorAmount) - BigInt(headAmount)
+            ).toString(),
+            additiveThresholdSompi: accepted.extra.additiveThresholdSompi,
+            challengeId: accepted.extra.challengeId,
+          }
+        : {}),
+    },
+    serverBroadcast: {
+      txid: settlement.transaction,
+      finality: settlementExtra.finality,
+    },
+    economics,
+    preBroadcastVerify,
+    duplicate: { status: duplicate.status, handlerExecutions },
+    replay: { status: replay.status, error: replay.body.error },
+  };
+}
+
+function reauthorizeExactPayload({
+  paymentPayload,
+  transactionId,
+  requestHash,
+  paymentIdentifier,
+  schnorr,
+  fundingPrivateKeyHex,
+  expiresAt,
+}) {
+  const replay = JSON.parse(JSON.stringify(paymentPayload));
+  if (paymentIdentifier)
+    replay.extensions["payment-identifier"].info.id = paymentIdentifier;
+  const accepted = replay.accepted;
+  const authorization = replay.payload.authorization;
+  const digest = exactRequestAuthorizationDigest({
+    network: accepted.network,
+    profile: replay.payload.profile,
+    transactionId,
+    paymentOutputIndex: replay.payload.paymentOutputIndex,
+    amount: accepted.amount,
+    payTo: accepted.payTo,
+    payToScriptPublicKey: accepted.extra.payToScriptPublicKey,
+    paymentRequirementsHash: sha256Hex(stableStringify(accepted)),
+    requestHash,
+    paymentIdentifier: replay.extensions["payment-identifier"].info.id,
+    challengeId: replay.payload.challengeId,
+    inputIndex: authorization.inputIndex,
+    expiresAt: expiresAt ?? authorization.expiresAt,
+  });
+  replay.payload.requestHash = requestHash;
+  replay.payload.authorization = {
+    ...authorization,
+    expiresAt: expiresAt ?? authorization.expiresAt,
+    digest,
+    signature: bytesToHex(
+      schnorr.sign(
+        hexToBytes(digest, { expectedLength: 32 }),
+        hexToBytes(fundingPrivateKeyHex, { expectedLength: 32 }),
+      ),
+    ),
+  };
+  return replay;
+}
+
+async function runExpiredExactAuthorization({
+  client,
+  server,
+  pendingBroadcasts,
+  sdk,
+  schnorr,
+  fundingPrivateKeyHex,
+}) {
+  const { resource, paymentRequired } = await exactChallenge({
+    server,
+    profile: "standard-native",
+    amount: EXACT_TINY_AMOUNT,
+    label: "expired-authorization",
+  });
+  const payment = await client.createPayment(paymentRequired, {
+    url: resource.url,
+    paymentIdentifier: "live_exact_expired_authorization_0001",
+  });
+  const requestHash = payment.paymentPayload.payload.requestHash;
+  if (!requestHash)
+    throw new Error("expired-authorization payment has no request hash");
+  const transactionId = exactArtifactTransactionId(
+    sdk,
+    payment.paymentPayload.payload.transaction,
+  );
+  const expired = reauthorizeExactPayload({
+    paymentPayload: payment.paymentPayload,
+    transactionId,
+    requestHash,
+    schnorr,
+    fundingPrivateKeyHex,
+    expiresAt: new Date(Date.now() - 1_000).toISOString(),
+  });
+  let handlerExecutions = 0;
+  const broadcastsBefore = pendingBroadcasts.size;
+  const response = await server.handlePaidRequest(
+    requestWithPayment(expired, { routeAccess: "public",
+      url: resource.url,
+      resource,
+      scheme: "exact",
+      amount: EXACT_TINY_AMOUNT,
+      requestHash,
+    }),
+    async () => {
+      handlerExecutions += 1;
+      return { status: 200, body: { ok: false } };
+    },
+  );
+  const broadcasts = pendingBroadcasts.size - broadcastsBefore;
+  if (
+    response.status !== 402 ||
+    response.body?.error !== "invalid_payload" ||
+    handlerExecutions !== 0 ||
+    broadcasts !== 0
+  ) {
+    throw new Error(
+      "expired exact authorization did not return the expected corrective 402 invalid_payload rejection",
+    );
+  }
+  return {
+    status: response.status,
+    error: response.body?.error,
+    handlerExecutions,
+    broadcasts,
+  };
+}
+
+async function exactChallenge({
+  server,
+  profile,
+  amount,
+  label,
+  preferredHeadId,
+}) {
+  for (let attempt = 0; attempt < 64; attempt += 1) {
+    const resource = {
+      url: `https://live.kaspa-x402.local/exact/${profile}/${label}?offer=${attempt}`,
+      description: `Live ${label} ${profile} exact proof`,
+    };
+    const unpaid = await server.handlePaidRequest(
+      trustedLoopbackProofRequest({
+        routeAccess: "public",
+        method: "GET",
+        url: resource.url,
+        body: null,
+        headers: {},
+        resource,
+        paymentAmount: amount,
+        paymentScheme: "exact",
+      }),
+      async () => ({ status: 200, body: { ok: false } }),
+    );
+    const paymentRequired = unpaid.headers?.[PAYMENT_REQUIRED_HEADER];
+    if (unpaid.status !== 402 || !paymentRequired) {
+      throw new Error(
+        `${profile} exact unpaid request did not return a payment challenge: ${unpaid.status}`,
+      );
+    }
+    if (!preferredHeadId) return { resource, paymentRequired };
+    const accepted = decodePaymentRequired(paymentRequired);
+    if (accepted.extra.headId === preferredHeadId) {
+      return { resource, paymentRequired, accepted };
+    }
+  }
+  throw new Error(`could not select additive head ${preferredHeadId}`);
+}
+
+async function runAdditiveConflict({
+  client,
+  server,
+  preferredHeadId,
+  sdk,
+  networkId,
+}) {
+  const { resource, paymentRequired, accepted } = await exactChallenge({
+    server,
+    profile: "additive",
+    amount: EXACT_AMOUNT,
+    label: "conflict",
+    preferredHeadId,
+  });
+  const payments = [];
+  for (let contender = 0; contender < 2; contender += 1) {
+    payments.push(
+      await client.createPayment(paymentRequired, {
+        url: resource.url,
+        paymentIdentifier: `live_exact_additive_conflict_000${contender + 1}`,
+      }),
+    );
+  }
+  const requestHashes = payments.map(
+    (payment) => payment.paymentPayload.payload.requestHash,
+  );
+  if (requestHashes.some((requestHash) => !requestHash)) {
+    throw new Error("additive conflict payment did not include a request hash");
+  }
+  const transactionIds = payments.map((payment) =>
+    exactArtifactTransactionId(sdk, payment.paymentPayload.payload.transaction),
+  );
+  if (transactionIds[0] === transactionIds[1]) {
+    throw new Error(
+      "additive conflict contenders must use distinct transactions",
+    );
+  }
+  let handlerExecutions = 0;
+  const handler = async () => {
+    handlerExecutions += 1;
+    return { status: 200, body: { ok: true, flow: "conflict" } };
+  };
+  const responses = await Promise.all(
+    payments.map((payment, index) =>
+      server.handlePaidRequest(
+        requestWithPayment(payment.paymentPayload, { routeAccess: "public",
+          url: resource.url,
+          resource,
+          scheme: "exact",
+          amount: EXACT_AMOUNT,
+          requestHash: requestHashes[index],
+        }),
+        handler,
+      ),
+    ),
+  );
+  const winnerIndex = responses.findIndex(
+    (response) => response.status === 200,
+  );
+  const loserIndex = responses.findIndex((response) => response.status === 402);
+  if (winnerIndex < 0 || loserIndex < 0 || handlerExecutions !== 1) {
+    throw new Error(
+      `additive conflict did not produce one winner and one refreshed loser: ${responses.map((response) => response.status).join(",")}`,
+    );
+  }
+  const winnerSettlement = decodeResponse(responses[winnerIndex]);
+  await client.applySettlement(payments[winnerIndex], winnerSettlement);
+  const refreshedHeader =
+    responses[loserIndex].headers?.[PAYMENT_REQUIRED_HEADER];
+  if (!refreshedHeader)
+    throw new Error("additive loser did not receive refreshed terms");
+  const refreshed = decodePaymentRequired(refreshedHeader);
+  if (
+    refreshed.extra.headId === accepted.extra.headId &&
+    BigInt(refreshed.extra.headVersion ?? "0") <=
+      BigInt(accepted.extra.headVersion ?? "0")
+  ) {
+    throw new Error(
+      "additive loser did not receive an advanced or alternate head",
+    );
+  }
+  let replacementBlocked = false;
+  try {
+    await client.createPayment(refreshedHeader, {
+      url: resource.url,
+      requestHash: requestHashes[loserIndex],
+      paymentIdentifier: `live_exact_additive_conflict_000${loserIndex + 1}`,
+    });
+  } catch (error) {
+    replacementBlocked =
+      error?.code === "invalid_kaspa_exact_replay" &&
+      String(error?.message).includes("different immutable intent");
+  }
+  if (!replacementBlocked || handlerExecutions !== 1) {
+    throw new Error(
+      `refreshed additive loser was not held pending: ${replacementBlocked}/${handlerExecutions}`,
+    );
+  }
+  return {
+    initialHeadId: accepted.extra.headId,
+    initialHeadVersion: accepted.extra.headVersion,
+    transactionIds,
+    winnerTransactionId: winnerSettlement.transaction,
+    winnerStatus: responses[winnerIndex].status,
+    loserStatus: responses[loserIndex].status,
+    refreshedHeadId: refreshed.extra.headId,
+    refreshedHeadVersion: refreshed.extra.headVersion,
+    replacementBlocked,
+    handlerExecutions,
+    contenderEconomics: payments.map((payment) =>
+      exactTransactionEconomics({
+        sdk,
+        networkId,
+        transactionArtifact: payment.paymentPayload.payload.transaction,
+        profile: "additive",
+        amount: EXACT_AMOUNT,
+        headAmount: payment.paymentPayload.accepted.extra.headAmount,
+      }),
+    ),
+  };
+}
+
+async function runInvalidExactSignature({ client, server, pendingBroadcasts }) {
+  const { resource, paymentRequired } = await exactChallenge({
+    server,
+    profile: "standard-native",
+    amount: EXACT_TINY_AMOUNT,
+    label: "invalid-signature",
+  });
+  const payment = await client.createPayment(paymentRequired, {
+    url: resource.url,
+    paymentIdentifier: "live_exact_invalid_signature_0001",
+  });
+  const requestHash = payment.paymentPayload.payload.requestHash;
+  if (!requestHash)
+    throw new Error("invalid-signature payment has no request hash");
+  const forged = JSON.parse(JSON.stringify(payment.paymentPayload));
+  const signature = forged.payload.authorization.signature;
+  forged.payload.authorization.signature = `${signature[0] === "0" ? "1" : "0"}${signature.slice(1)}`;
+  let handlerExecutions = 0;
+  const broadcastsBefore = pendingBroadcasts.size;
+  const response = await server.handlePaidRequest(
+    requestWithPayment(forged, { routeAccess: "public",
+      url: resource.url,
+      resource,
+      scheme: "exact",
+      amount: EXACT_TINY_AMOUNT,
+      requestHash,
+    }),
+    async () => {
+      handlerExecutions += 1;
+      return { status: 200, body: { ok: false } };
+    },
+  );
+  const broadcasts = pendingBroadcasts.size - broadcastsBefore;
+  if (response.status < 400 || handlerExecutions !== 0 || broadcasts !== 0) {
+    throw new Error(
+      "invalid exact authorization reached protected work or broadcast",
+    );
+  }
+  return {
+    status: response.status,
+    error: response.body?.error,
+    handlerExecutions,
+    broadcasts,
+  };
+}
+
+async function runExactRestartRecovery({
+  client,
+  baseServerConfig,
+  store,
+  chain,
+}) {
+  let injected = false;
+  const faultingChain = {
+    ...chain,
+    async sendTransaction(transaction) {
+      const result = await chain.sendTransaction(transaction);
+      if (!injected) {
+        injected = true;
+        throw new Error("injected post-broadcast process failure");
+      }
+      return result;
+    },
+  };
+  const beforeRestart = new DirectModeServer({
+    ...baseServerConfig,
+    store,
+    chainProvider: faultingChain,
+    exactProfile: "standard-native",
+  });
+  const { resource, paymentRequired } = await exactChallenge({
+    server: beforeRestart,
+    profile: "standard-native",
+    amount: EXACT_AMOUNT,
+    label: "restart-recovery",
+  });
+  const payment = await client.createPayment(paymentRequired, {
+    url: resource.url,
+    paymentIdentifier: "live_exact_restart_recovery_0001",
+  });
+  const requestHash = payment.paymentPayload.payload.requestHash;
+  if (!requestHash)
+    throw new Error("recovery payment did not include a request hash");
+  let handlerExecutions = 0;
+  const request = requestWithPayment(payment.paymentPayload, { routeAccess: "public",
+    url: resource.url,
+    resource,
+    scheme: "exact",
+    amount: EXACT_AMOUNT,
+    requestHash,
+  });
+  const handler = async () => {
+    handlerExecutions += 1;
+    return { status: 200, body: { ok: true, flow: "restart-recovery" } };
+  };
+  const first = await beforeRestart.handlePaidRequest(request, handler);
+  if (
+    first.status !== 503 ||
+    first.body?.error !== "exact_settlement_recovery_required" ||
+    handlerExecutions !== 0
+  ) {
+    throw new Error("post-broadcast failure did not enter durable recovery");
+  }
+  const transactionId = payment.transactionId;
+  if (!transactionId)
+    throw new Error("recovery payment did not expose a transaction id");
+  const afterRestart = new DirectModeServer({
+    ...baseServerConfig,
+    store,
+    chainProvider: chain,
+    exactProfile: "standard-native",
+  });
+  const reconciled = await afterRestart.reconcileExactSettlement(transactionId);
+  if (reconciled?.status !== "accepted") {
+    throw new Error(
+      "restarted server did not reconcile the accepted transaction",
+    );
+  }
+  const retry = await afterRestart.handlePaidRequest(request, handler);
+  if (retry.status !== 200 || handlerExecutions !== 1) {
+    throw new Error(
+      "reconciled exact retry did not execute protected work once",
+    );
+  }
+  await client.applySettlement(payment, decodeResponse(retry));
+  return {
+    transactionId,
+    initialStatus: first.status,
+    recoveryError: first.body.error,
+    reconciledStatus: reconciled.status,
+    reconciledFinality: reconciled.finality,
+    retryStatus: retry.status,
+    handlerExecutions,
+    runtimeReinstantiated: true,
+    durableStorePreserved: true,
+  };
+}
+
+async function runExternalHeadAdvance({
+  client,
+  server,
+  store,
+  chain,
+  sdk,
+  preferredHeadId,
+  externalHeadProofs,
+}) {
+  const before = await store.loadExactHead(preferredHeadId);
+  if (!before || before.status !== "available") {
+    throw new Error("external advancement target head is unavailable");
+  }
+  const { resource, paymentRequired } = await exactChallenge({
+    server,
+    profile: "additive",
+    amount: EXACT_AMOUNT,
+    label: "external-advance",
+    preferredHeadId,
+  });
+  const payment = await client.createPayment(paymentRequired, {
+    url: resource.url,
+    paymentIdentifier: "live_exact_external_advance_0001",
+  });
+  if (!payment.paymentPayload.payload.requestHash) {
+    throw new Error(
+      "external advancement payment did not include a request hash",
+    );
+  }
+  const transaction = payment.paymentPayload.payload.transaction;
+  const transactionId = exactArtifactTransactionId(sdk, transaction);
+  externalHeadProofs.set(transactionId.toLowerCase(), { transaction });
+  const broadcast = await chain.sendTransaction(transaction);
+  if (
+    broadcast.transactionId.toLowerCase() !== transactionId.toLowerCase() ||
+    broadcast.finality !== "accepted"
+  ) {
+    throw new Error(
+      "external head advancement did not reach accepted finality",
+    );
+  }
+  const after = await server.reconcileExactHead(preferredHeadId, [
+    transactionId,
+  ]);
+  if (
+    BigInt(after.version) !== BigInt(before.version) + 1n ||
+    after.currentOutpoint.txid.toLowerCase() !== transactionId.toLowerCase()
+  ) {
+    throw new Error(
+      "trusted external head reconciliation did not advance state",
+    );
+  }
+  return {
+    headId: preferredHeadId,
+    transactionId,
+    finality: broadcast.finality,
+    beforeVersion: before.version,
+    afterVersion: after.version,
+    beforeOutpoint: before.currentOutpoint,
+    afterOutpoint: after.currentOutpoint,
+    trustedCandidateCount: 1,
+  };
+}
+
+async function buildExactTransaction(input) {
+  return input.request.profile === "additive"
+    ? buildKip10ExactTransaction(input)
+    : buildStandardExactTransaction(input);
+}
+
+async function buildStandardExactTransaction(input) {
+  const {
+    rpc,
+    sdk,
+    fundingPrivateKey,
+    fundingPrivateKeyHex,
+    fundingAddress,
+    request,
+    schnorr,
+    spentOutpoints,
+  } = input;
+  const paymentAmount = BigInt(request.amount);
+  const fundingNeeded = paymentAmount + DEFAULT_FEE_SOMPI;
+  const fundingUtxo = await selectFundingUtxo(
+    rpc,
+    fundingAddress,
+    fundingNeeded + 10_000_000n,
+    spentOutpoints,
+  );
+  const fundingAmount = BigInt(fundingUtxo.amount);
+  const fundingScriptPublicKey = scriptPublicKeyFromSerialized(
+    sdk,
+    fundingUtxo.scriptPublicKey,
+  );
+  const paymentScriptPublicKey = sdk.payToAddressScript(request.payTo);
+  const outputs = [
+    { value: paymentAmount, scriptPublicKey: paymentScriptPublicKey },
+  ];
+  const change = fundingAmount - fundingNeeded;
+  if (change >= 10_000_000n)
+    outputs.push({
+      value: change,
+      scriptPublicKey: sdk.payToAddressScript(fundingAddress),
+    });
+  const inputBase = p2pkLegacyInputBase(
+    fundingUtxo.outpoint,
+    fundingAmount,
+    fundingScriptPublicKey,
+    0n,
+  );
+  const txShape = {
+    version: 0,
+    outputs,
+    lockTime: 0n,
+    subnetworkId: NATIVE_SUBNETWORK_ID,
+    gas: 0n,
+    payload: "",
+  };
+  const unsigned = new sdk.Transaction({
+    ...txShape,
+    inputs: [{ ...inputBase, signatureScript: "" }],
+  });
+  const signatureScript = sdk.createInputSignature(
+    unsigned,
+    0,
+    fundingPrivateKey,
+    sdk.SighashType.All,
+  );
+  const signed = new sdk.Transaction({
+    ...txShape,
+    inputs: [{ ...inputBase, signatureScript }],
+  });
+  return exactPaymentArtifact({
+    transaction: signed,
+    payerAddress: fundingAddress,
+    paymentOutputIndex: 0,
+    authorizationInputIndex: 0,
+    fundingPrivateKeyHex,
+    request,
+    schnorr,
+  });
+}
+
+async function buildKip10ExactTransaction(input) {
+  const {
+    rpc,
+    sdk,
+    fundingPrivateKey,
+    fundingPrivateKeyHex,
+    fundingAddress,
+    request,
+    schnorr,
+    spentOutpoints,
+  } = input;
+  const head = request.head;
+  if (!head)
+    throw new Error(
+      "KIP-10 additive exact transaction requires a head challenge",
+    );
+
+  const paymentAmount = BigInt(request.amount);
+  const headAmount = BigInt(head.headAmount);
+  if (paymentAmount < BigInt(head.additiveThresholdSompi))
+    throw new Error("exact payment is below the head additive threshold");
+  const fundingNeeded = paymentAmount + DEFAULT_FEE_SOMPI;
+  const fundingUtxo = await selectFundingUtxo(
+    rpc,
+    fundingAddress,
+    fundingNeeded + 10_000_000n,
+    spentOutpoints,
+  );
+  const fundingAmount = BigInt(fundingUtxo.amount);
+  if (fundingAmount < fundingNeeded) {
+    throw new Error(
+      `additive exact funding output ${fundingAmount} is below required ${fundingNeeded}`,
+    );
+  }
+  const headScriptPublicKey = scriptPublicKeyFromSerialized(
+    sdk,
+    head.headScriptPublicKey,
+  );
+  const fundingScriptPublicKey = scriptPublicKeyFromSerialized(
+    sdk,
+    fundingUtxo.scriptPublicKey,
+  );
+  const changeScriptPublicKey = sdk.payToAddressScript(fundingAddress);
+  const outputs = [
+    { value: headAmount + paymentAmount, scriptPublicKey: headScriptPublicKey },
+  ];
+  const change = fundingAmount - fundingNeeded;
+  if (change >= 10_000_000n) {
+    outputs.push({ value: change, scriptPublicKey: changeScriptPublicKey });
+  }
+  const headInput = p2shComputeBudgetInputBase(
+    head.expectedHeadOutpoint,
+    headAmount,
+    headScriptPublicKey,
+    0n,
+    EXACT_KIP10_COMPUTE_BUDGET,
+  );
+  const fundingInput = p2pkInputBase(
+    fundingUtxo.outpoint,
+    fundingAmount,
+    fundingScriptPublicKey,
+    0n,
+  );
+  const txShape = {
+    version: 1,
+    outputs,
+    lockTime: 0n,
+    subnetworkId: NATIVE_SUBNETWORK_ID,
+    gas: 0n,
+    payload: "",
+  };
+  const unsigned = new sdk.Transaction({
+    ...txShape,
+    inputs: [
+      { ...headInput, signatureScript: "" },
+      { ...fundingInput, signatureScript: "" },
+    ],
+  });
+  const fundingSignature = sdk.createInputSignature(
+    unsigned,
+    1,
+    fundingPrivateKey,
+    sdk.SighashType.All,
+  );
+  const headSignatureScript = sdk.payToScriptHashSignatureScript(
+    head.headRedeemScript,
+    buildKip10AdditiveBorrowArgs(),
+  );
+  const signed = new sdk.Transaction({
+    ...txShape,
+    inputs: [
+      { ...headInput, signatureScript: headSignatureScript },
+      { ...fundingInput, signatureScript: fundingSignature },
+    ],
+  });
+  return exactPaymentArtifact({
+    transaction: signed,
+    payerAddress: fundingAddress,
+    paymentOutputIndex: 0,
+    authorizationInputIndex: 1,
+    fundingPrivateKeyHex,
+    request,
+    schnorr,
+  });
+}
+
+function exactPaymentArtifact({
+  transaction,
+  payerAddress,
+  paymentOutputIndex,
+  authorizationInputIndex,
+  fundingPrivateKeyHex,
+  request,
+  schnorr,
+}) {
+  const digest = exactRequestAuthorizationDigest({
+    network: request.network,
+    profile: request.profile,
+    transactionId: transaction.id,
+    paymentOutputIndex,
+    amount: request.amount,
+    payTo: request.payTo,
+    payToScriptPublicKey: request.payToScriptPublicKey,
+    paymentRequirementsHash: request.paymentRequirementsHash,
+    requestHash: request.requestHash,
+    paymentIdentifier: request.paymentIdentifier,
+    challengeId: request.head?.challengeId,
+    inputIndex: authorizationInputIndex,
+    expiresAt: request.authorizationExpiresAt,
+  });
+  return {
+    transaction: transaction.serializeToSafeJSON(),
+    transactionEncoding: KIP10_EXACT_TRANSACTION_ENCODING,
+    paymentOutputIndex,
+    transactionId: transaction.id,
+    inputOutpoints: exactTransactionInputOutpoints(transaction),
+    authorization: {
+      version: "kaspa-x402-exact-request-authorization-v2",
+      inputIndex: authorizationInputIndex,
+      expiresAt: request.authorizationExpiresAt,
+      digest,
+      signature: bytesToHex(
+        schnorr.sign(
+          hexToBytes(digest, { expectedLength: 32 }),
+          hexToBytes(fundingPrivateKeyHex, { expectedLength: 32 }),
+        ),
+      ),
+    },
+    payerAddress,
+    fundingSource: "hot-wallet",
+  };
+}
+
+function exactTransactionInputOutpoints(transaction) {
+  return transaction.serializeToObject().inputs.map((input) => {
+    const outpoint = transactionInputOutpoint(input);
+    if (!outpoint)
+      throw new Error("signed exact transaction input is missing its outpoint");
+    return outpoint;
+  });
+}
+
+function exactArtifactTransactionId(sdk, transactionArtifact) {
+  return sdk.Transaction.deserializeFromSafeJSON(transactionArtifact).id;
+}
+
+function exactTransactionEconomics({
+  sdk,
+  networkId,
+  transactionArtifact,
+  profile,
+  amount,
+  headAmount,
+}) {
+  const transaction =
+    sdk.Transaction.deserializeFromSafeJSON(transactionArtifact);
+  const object = transaction.serializeToObject();
+  const inputAmount = object.inputs.reduce(
+    (sum, input) => sum + BigInt(input.utxo?.amount ?? 0),
+    0n,
+  );
+  const outputAmount = object.outputs.reduce(
+    (sum, output) => sum + BigInt(output.value ?? 0),
+    0n,
+  );
+  const fee = inputAmount - outputAmount;
+  if (fee < 0n) throw new Error("exact transaction outputs exceed inputs");
+  const mass = sdk.calculateTransactionMass(networkId, transaction);
+  const minimumFee = sdk.calculateTransactionFee(networkId, transaction);
+  const merchantGain =
+    profile === "additive"
+      ? BigInt(object.outputs[0]?.value ?? 0) - BigInt(headAmount ?? 0)
+      : BigInt(object.outputs[0]?.value ?? 0);
+  if (merchantGain !== BigInt(amount)) {
+    throw new Error(
+      `${profile} merchant gain ${merchantGain} does not equal ${amount}`,
+    );
+  }
+  return {
+    inputAmountSompi: inputAmount.toString(),
+    outputAmountSompi: outputAmount.toString(),
+    feeSompi: fee.toString(),
+    minimumFeeSompi: BigInt(minimumFee ?? 0).toString(),
+    payerCostSompi: (BigInt(amount) + fee).toString(),
+    merchantGainSompi: merchantGain.toString(),
+    mass: BigInt(mass).toString(),
+    storageMass: BigInt(
+      object.storageMass ?? transaction.storageMass ?? 0,
+    ).toString(),
+    computeBudgets: object.inputs.map((input) =>
+      Number(input.computeBudget ?? 0),
+    ),
+    inputCount: object.inputs.length,
+    outputCount: object.outputs.length,
+  };
+}
+
+async function createFundingSplit({
+  rpc,
+  sdk,
+  networkId,
+  fundingPrivateKey,
+  fundingAddress,
+  spentOutpoints,
+}) {
+  const reusable = (await getAddressUtxos(rpc, fundingAddress))
+    .filter(
+      (utxo) =>
+        BigInt(utxo.amount) >= FUNDING_SPLIT_SHARD_AMOUNT &&
+        !spentOutpoints.has(outpointKey(utxo.outpoint)),
+    )
+    .slice(0, FUNDING_SPLIT_SHARDS);
+  if (reusable.length >= MIN_REUSABLE_FUNDING_SHARDS) {
+    return {
+      reusedExisting: true,
+      requestedShards: FUNDING_SPLIT_SHARDS,
+      shardAmountSompi: FUNDING_SPLIT_SHARD_AMOUNT.toString(),
+      observedOutputs: reusable.map((utxo) => ({
+        outpoint: utxo.outpoint,
+        amount: utxo.amount,
+      })),
+    };
+  }
+  const sent = await sendFromFunding({
+    rpc,
+    sdk,
+    networkId,
+    fundingPrivateKey,
+    fundingAddress,
+    spentOutpoints,
+    outputs: Array.from({ length: FUNDING_SPLIT_SHARDS }, () => ({
+      address: fundingAddress,
+      amount: FUNDING_SPLIT_SHARD_AMOUNT,
+    })),
+  });
+  const started = Date.now();
+  let observed = [];
+  while (Date.now() - started < DEFAULT_CONFIRMATION_TIMEOUT_MS) {
+    observed = (await getAddressUtxos(rpc, fundingAddress)).filter(
+      (utxo) => utxo.outpoint.txid.toLowerCase() === sent.txid.toLowerCase(),
+    );
+    if (observed.length >= FUNDING_SPLIT_SHARDS) break;
+    await sleep(1_000);
+  }
+  if (observed.length < FUNDING_SPLIT_SHARDS) {
+    throw new Error(
+      `funding split exposed ${observed.length} outputs instead of at least ${FUNDING_SPLIT_SHARDS}`,
+    );
+  }
+  return {
+    txid: sent.txid,
+    txVersion: sent.txVersion,
+    txVersionSource: sent.txVersionSource,
+    requestedShards: FUNDING_SPLIT_SHARDS,
+    shardAmountSompi: FUNDING_SPLIT_SHARD_AMOUNT.toString(),
+    observedOutputs: observed.map((utxo) => ({
+      outpoint: utxo.outpoint,
+      amount: utxo.amount,
+    })),
+  };
+}
+
+async function createKip10Head(input) {
+  const {
+    rpc,
+    sdk,
+    addressCodec,
+    network,
+    fundingPrivateKey,
+    fundingAddress,
+    fundingPublicKey,
+    knownUtxos,
+    spentOutpoints,
+  } = input;
+  const headAmount = BigInt(EXACT_KIP10_HEAD_AMOUNT);
+  const redeemScript = buildKip10AdditiveRedeemScript({
+    ownerPublicKey: fundingPublicKey,
+    amount: EXACT_KIP10_ADDITIVE_THRESHOLD,
+  });
+  const scriptPublicKey = kip10AdditiveScriptPublicKey({
+    ownerPublicKey: fundingPublicKey,
+    amount: EXACT_KIP10_ADDITIVE_THRESHOLD,
+  });
+  const serialized = serializedScriptPublicKey(scriptPublicKey);
+  const payTo = addressCodec.encodeScriptAddress({
+    network,
+    scriptPublicKey,
+    serializedScriptPublicKey: serialized,
+  });
+  const source = await selectFundingUtxo(
+    rpc,
+    fundingAddress,
+    headAmount + DEFAULT_FEE_SOMPI + 10_000_000n,
+    spentOutpoints,
+  );
+  const sourceAmount = BigInt(source.amount);
+  const sourceScriptPublicKey = scriptPublicKeyFromSerialized(
+    sdk,
+    source.scriptPublicKey,
+  );
+  const headSpk = scriptPublicKeyFromSerialized(sdk, serialized);
+  const fundingSpk = sdk.payToAddressScript(fundingAddress);
+  const change = sourceAmount - headAmount - DEFAULT_FEE_SOMPI;
+  if (change < 10_000_000n) {
+    throw new Error(
+      `funding UTXO ${sourceAmount} leaves non-standard change ${change}`,
+    );
+  }
+  const txShape = {
+    version: 0,
+    outputs: [
+      { value: headAmount, scriptPublicKey: headSpk },
+      { value: change, scriptPublicKey: fundingSpk },
+    ],
+    lockTime: 0n,
+    subnetworkId: NATIVE_SUBNETWORK_ID,
+    gas: 0n,
+    payload: "",
+  };
+  const inputBase = p2pkLegacyInputBase(
+    source.outpoint,
+    sourceAmount,
+    sourceScriptPublicKey,
+    0n,
+  );
+  const unsigned = new sdk.Transaction({
+    ...txShape,
+    inputs: [{ ...inputBase, signatureScript: "" }],
+  });
+  const signatureScript = sdk.createInputSignature(
+    unsigned,
+    0,
+    fundingPrivateKey,
+    sdk.SighashType.All,
+  );
+  const signed = new sdk.Transaction({
+    ...txShape,
+    inputs: [{ ...inputBase, signatureScript }],
+  });
+  const { transactionId } = await rpc.submitTransaction({
+    transaction: signed,
+    allowOrphan: false,
+  });
+  markOutpointSpent(spentOutpoints, source.outpoint);
+  const txid = String(transactionId);
+  const utxo = await waitForAddressOutpoint({
+    rpc,
+    address: payTo,
+    txid,
+    index: 0,
+    amount: headAmount,
+    scriptPublicKey: serialized,
+  });
+  rememberUtxo(knownUtxos, utxo);
+  const now = new Date().toISOString();
+  const headId = hash({
+    scope: "kaspa:x402:additive-head:v1",
+    network,
+    payTo,
+    redeemScript,
+    fundingOutpoint: utxo.outpoint,
+  });
+  return {
+    record: {
+      headId,
+      network,
+      payTo,
+      templateId: KIP10_ADDITIVE_TEMPLATE_ID,
+      transactionEncoding: KIP10_EXACT_TRANSACTION_ENCODING,
+      currentOutpoint: utxo.outpoint,
+      currentAmount: utxo.amount,
+      scriptPublicKey: serialized,
+      redeemScript,
+      additiveThresholdSompi: EXACT_KIP10_ADDITIVE_THRESHOLD,
+      version: "0",
+      status: "available",
+      createdAt: now,
+      updatedAt: now,
+    },
+    funding: {
+      txid,
+      txVersion: 0,
+      txVersionSource: ADAPTER_SUBMITTED_TX_VERSION_SOURCE,
+      outpoint: utxo.outpoint,
+      amount: utxo.amount,
+    },
+  };
+}
+
+function verifyExactTransaction({
+  sdk,
+  schnorr,
+  transactionArtifact,
+  request,
+  fundingAddress,
+  fundingPublicKey,
+}) {
+  if (request.transactionEncoding !== KIP10_EXACT_TRANSACTION_ENCODING) {
+    throw new Error("unsupported exact transaction encoding");
+  }
+  const tx = sdk.Transaction.deserializeFromSafeJSON(transactionArtifact);
+  const object = tx.serializeToObject();
+  const paymentOutput = object.outputs?.[request.paymentOutputIndex];
+  if (!paymentOutput)
+    throw new Error("exact transaction is missing payment output");
+  const paymentScriptPublicKey = String(
+    paymentOutput.scriptPublicKey ?? "",
+  ).toLowerCase();
+  if (paymentScriptPublicKey !== request.payToScriptPublicKey.toLowerCase()) {
+    throw new Error(
+      "exact transaction payment output script does not match payTo",
+    );
+  }
+  if (request.profile === "standard-native") {
+    if (Number(object.version) !== 0)
+      throw new Error(
+        "standard-native exact transaction must use transaction version 0",
+      );
+    if (String(paymentOutput.value) !== request.amount)
+      throw new Error(
+        "standard-native exact output amount does not match accepted amount",
+      );
+    return {
+      transactionId: tx.id,
+      paymentOutput: {
+        amount: request.amount,
+        scriptPublicKey: paymentScriptPublicKey,
+        address: request.payTo,
+      },
+      payerAddress: fundingAddress,
+      requestAuthorization: verifyRequestAuthorization({
+        request,
+        transactionId: tx.id,
+        fundingPublicKey,
+        schnorr,
+      }),
+    };
+  }
+  const head = request.head;
+  if (!head)
+    throw new Error(
+      "additive exact verification requires head challenge terms",
+    );
+  if (Number(object.version) !== 1)
+    throw new Error(
+      "additive exact transaction must use transaction version 1",
+    );
+  const headInputIndex = object.inputs.findIndex((entry) => {
+    const outpoint = transactionInputOutpoint(entry);
+    return (
+      outpoint?.txid.toLowerCase() ===
+        head.expectedHeadOutpoint.txid.toLowerCase() &&
+      outpoint.index === head.expectedHeadOutpoint.index
+    );
+  });
+  if (headInputIndex !== 0)
+    throw new Error(
+      "additive exact transaction must spend the expected head at input index 0",
+    );
+  const advertisedHeadScript = serializedScriptPublicKey(
+    sdk.payToScriptHashScript(head.headRedeemScript),
+  ).toLowerCase();
+  if (advertisedHeadScript !== head.headScriptPublicKey.toLowerCase()) {
+    throw new Error(
+      "additive head redeem script does not match its script public key",
+    );
+  }
+  const headInput = object.inputs[headInputIndex];
+  if (
+    String(headInput.utxo?.scriptPublicKey ?? "").toLowerCase() !==
+    head.headScriptPublicKey.toLowerCase()
+  ) {
+    throw new Error(
+      "additive exact head input script does not match the challenge",
+    );
+  }
+  if (String(headInput.utxo?.amount ?? "") !== head.headAmount) {
+    throw new Error(
+      "additive exact head input amount does not match the challenge",
+    );
+  }
+  const continuation = object.outputs[0];
+  if (!continuation)
+    throw new Error("exact transaction is missing KIP-10 continuation output");
+  if (
+    String(continuation.scriptPublicKey ?? "").toLowerCase() !==
+    head.headScriptPublicKey.toLowerCase()
+  ) {
+    throw new Error(
+      "exact transaction KIP-10 continuation script does not match the head",
+    );
+  }
+  const expectedSuccessorAmount =
+    BigInt(head.headAmount) + BigInt(request.amount);
+  if (BigInt(continuation.value) !== expectedSuccessorAmount) {
+    throw new Error(
+      "exact transaction KIP-10 successor delta does not equal the accepted payment amount",
+    );
+  }
+
+  return {
+    transactionId: tx.id,
+    paymentOutput: {
+      amount: request.amount,
+      scriptPublicKey: paymentScriptPublicKey,
+      address: request.payTo,
+    },
+    continuation: {
+      outpoint: { txid: tx.id, index: 0 },
+      amount: String(continuation.value),
+      scriptPublicKey: paymentScriptPublicKey,
+    },
+    payerAddress: fundingAddress,
+    requestAuthorization: verifyRequestAuthorization({
+      request,
+      transactionId: tx.id,
+      fundingPublicKey,
+      schnorr,
+    }),
+  };
+}
+
+function verifyRequestAuthorization({
+  request,
+  transactionId,
+  fundingPublicKey,
+  schnorr,
+}) {
+  const authorization = request.authorization;
+  const expectedInputIndex = request.profile === "additive" ? 1 : 0;
+  if (authorization.inputIndex !== expectedInputIndex) {
+    throw new Error("exact request authorization uses the wrong funding input");
+  }
+  if (Date.parse(authorization.expiresAt) <= Date.now()) {
+    throw new Error("exact request authorization has expired");
+  }
+  const digest = exactRequestAuthorizationDigest({
+    network: request.network,
+    profile: request.profile,
+    transactionId,
+    paymentOutputIndex: request.paymentOutputIndex,
+    amount: request.amount,
+    payTo: request.payTo,
+    payToScriptPublicKey: request.payToScriptPublicKey,
+    paymentRequirementsHash: request.paymentRequirementsHash,
+    requestHash: request.requestHash,
+    paymentIdentifier: request.paymentIdentifier,
+    challengeId: request.head?.challengeId,
+    inputIndex: authorization.inputIndex,
+    expiresAt: authorization.expiresAt,
+  });
+  if (authorization.digest.toLowerCase() !== digest) {
+    throw new Error("exact request authorization digest does not match");
+  }
+  if (
+    !schnorr.verify(
+      hexToBytes(authorization.signature, { expectedLength: 64 }),
+      hexToBytes(digest, { expectedLength: 32 }),
+      hexToBytes(fundingPublicKey, { expectedLength: 32 }),
+    )
+  ) {
+    throw new Error("exact request authorization signature is invalid");
+  }
+  return {
+    authorizationId: exactRequestAuthorizationId(authorization),
+    digest,
+    inputIndex: authorization.inputIndex,
+    publicKey: fundingPublicKey,
+  };
+}
+
+function hostedBatchExpectationsFromEnv() {
+  const expected = {
+    releaseVersion: process.env.KASPA_X402_EXPECTED_RELEASE_VERSION,
+    amount: process.env.KASPA_X402_EXPECTED_BATCH_AMOUNT,
+    minDepositSompi: process.env.KASPA_X402_EXPECTED_MIN_DEPOSIT_SOMPI,
+    payTo: process.env.KASPA_X402_EXPECTED_BATCH_PAY_TO,
+    serverPublicKey: process.env.KASPA_X402_EXPECTED_SERVER_PUBLIC_KEY,
+  };
+  const missing = Object.entries(expected)
+    .filter(([, value]) => !value)
+    .map(([key]) => key);
+  if (missing.length > 0) {
+    throw new Error(
+      `hosted batch canary is missing operator pins: ${missing.join(", ")}`,
+    );
+  }
+  return expected;
+}
+
+async function runHostedBatchCanary(input) {
+  const batchUrl = new URL("/batch", input.gatewayBase).toString();
+  const gatewayOrigin = new URL(batchUrl).origin;
+  const healthResponse = await fetch(new URL("/health", input.gatewayBase));
+  const health = await healthResponse.json();
+  if (
+    healthResponse.status !== 200 ||
+    health?.ok !== true ||
+    health?.enabled !== true ||
+    health?.releaseVersion !== input.expected.releaseVersion
+  ) {
+    throw new Error("hosted batch gateway health does not match operator pins");
+  }
+
+  const firstRequired = await fetchHostedPaymentRequired(batchUrl);
+  const required = decodePaymentRequiredHeader(firstRequired);
+  const offers = required.accepts.filter(
+    (entry) => entry.scheme === "batch-settlement",
+  );
+  if (offers.length !== 1)
+    throw new Error("hosted batch route must advertise exactly one batch offer");
+  const accepted = offers[0];
+  if (
+    required.resource.url !== batchUrl ||
+    new URL(required.resource.url).origin !== gatewayOrigin ||
+    accepted.network !== input.network ||
+    accepted.amount !== input.expected.amount ||
+    accepted.payTo !== input.expected.payTo ||
+    accepted.extra.binding !== "kaspa-escrow-v3" ||
+    accepted.extra.templateId !== "kaspa-x402-escrow-v5" ||
+    accepted.extra.minDepositSompi !== input.expected.minDepositSompi ||
+    accepted.extra.serverPublicKey !== input.expected.serverPublicKey
+  ) {
+    throw new Error("hosted batch offer does not match operator pins");
+  }
+
+  const virtualDaa = BigInt(await input.fundingProvider.getVirtualDaaScore());
+  const refundHorizon = BigInt(accepted.extra.refundTimeoutDaa) - virtualDaa;
+  if (refundHorizon < 1n || refundHorizon > 40_000n)
+    throw new Error("hosted batch refund horizon is outside the operator cap");
+
+  const hostedStore = new MemoryChannelStore();
+  input.batchRecovery.clientStore = hostedStore;
+  const client = new DirectModeClient({
+    addressCodec: input.addressCodec,
+    fundingProvider: input.fundingProvider,
+    store: hostedStore,
+    fundingPolicy: {
+      requiredSource: "hot-wallet",
+      batchPayment: {
+        maximumBatchChargeSompi: input.expected.amount,
+        maximumInitialDepositSompi: input.expected.minDepositSompi,
+        maximumTopUpSompi: input.expected.minDepositSompi,
+        maximumCumulativeAuthorizationSompi: input.expected.minDepositSompi,
+        maximumTotalExposureSompi: input.expected.minDepositSompi,
+        minimumRefundLeadDaa: "1",
+        maximumRefundHorizonDaa: "40000",
+        allowedOrigins: [gatewayOrigin],
+        allowedResources: [batchUrl],
+        allowedPayTo: [input.expected.payTo],
+        allowedServerPublicKeys: [input.expected.serverPublicKey],
+        allowedFundingSources: ["hot-wallet"],
+      },
+    },
+    supportedNetworks: [input.network],
+    supportedSchemes: ["batch-settlement"],
+    confirmationThreshold: CONFIRMATION_THRESHOLD,
+    batch: {
+      signer: input.signer,
+      refundAddress: input.fundingAddress,
+      verifyVoucherSignature(voucher, channel) {
+        const digest = voucherDigest({
+          network: channel.config.network,
+          covenantId: channel.covenantId,
+          authorizedCumulativeAmount: voucher.authorizedCumulativeAmount,
+        });
+        return input.schnorr.verify(
+          hexToBytes(voucher.signature, { expectedLength: 64 }),
+          hexToBytes(digest, { expectedLength: 32 }),
+          hexToBytes(channel.clientPublicKey, { expectedLength: 32 }),
+        );
+      },
+    },
+  });
+
+  const deposit = await createHostedBatchPayment({
+    client,
+    batchUrl,
+    requiredHeader: firstRequired,
+    paymentIdentifier: `hosted-batch-deposit-${Date.now()}`,
+  });
+  if (
+    deposit.payment.openedChannel !== true ||
+    deposit.payment.paymentPayload.payload.type !== "deposit-voucher"
+  ) {
+    throw new Error("hosted batch deposit did not open a channel");
+  }
+  const depositChannel = await client.applySettlement(
+    deposit.payment,
+    deposit.settlement,
+  );
+
+  const voucher = await createHostedBatchPayment({
+    client,
+    batchUrl,
+    requiredHeader: await fetchHostedPaymentRequired(batchUrl),
+    paymentIdentifier: `hosted-batch-voucher-${Date.now()}`,
+  });
+  if (
+    voucher.payment.openedChannel !== false ||
+    voucher.payment.paymentPayload.payload.type !== "voucher"
+  ) {
+    throw new Error("hosted batch follow-up did not use a voucher");
+  }
+  const voucherChannel = await client.applySettlement(
+    voucher.payment,
+    voucher.settlement,
+  );
+
+  const duplicate = await submitHostedBatchPayment(
+    batchUrl,
+    deposit.payment.paymentPayload,
+    200,
+  );
+  const duplicateHeader = duplicate.headers.get(PAYMENT_RESPONSE_HEADER);
+  if (!duplicateHeader)
+    throw new Error("hosted batch duplicate is missing settlement");
+  const duplicateSettlement = decodePaymentResponseHeader(duplicateHeader);
+  if (duplicateSettlement.transaction !== deposit.settlement.transaction)
+    throw new Error("hosted batch duplicate did not reuse settlement");
+  input.batchRecovery.clientStore = input.clientStore;
+
+  return {
+    gatewayBase: gatewayOrigin,
+    releaseVersion: health.releaseVersion,
+    deposit: {
+      status: deposit.status,
+      transactionId: deposit.settlement.transaction,
+      channelId: depositChannel.channel.id,
+      openedChannel: true,
+      chargedCumulativeAmount: depositChannel.channel.chargedCumulativeAmount,
+    },
+    voucher: {
+      status: voucher.status,
+      transactionId: voucher.settlement.transaction,
+      openedChannel: false,
+      chargedCumulativeAmount: voucherChannel.channel.chargedCumulativeAmount,
+    },
+    duplicateReplay: {
+      status: duplicate.status,
+      transactionId: duplicateSettlement.transaction,
+    },
+  };
+}
+
+async function createHostedBatchPayment(input) {
+  const payment = await input.client.createPayment(input.requiredHeader, {
+    url: input.batchUrl,
+    paymentIdentifier: input.paymentIdentifier,
+  });
+  const response = await submitHostedBatchPayment(
+    input.batchUrl,
+    payment.paymentPayload,
+    200,
+  );
+  const header = response.headers.get(PAYMENT_RESPONSE_HEADER);
+  if (!header) throw new Error("hosted batch response is missing settlement");
+  return {
+    payment,
+    settlement: decodePaymentResponseHeader(header),
+    status: response.status,
+  };
+}
+
+async function fetchHostedPaymentRequired(url) {
+  const response = await fetch(url, { redirect: "error" });
+  if (response.status !== 402 || response.url !== url)
+    throw new Error(`hosted batch challenge returned ${response.status}`);
+  const header = response.headers.get(PAYMENT_REQUIRED_HEADER);
+  if (!header) throw new Error("hosted batch challenge is missing payment terms");
+  return header;
+}
+
+async function submitHostedBatchPayment(url, paymentPayload, expectedStatus) {
+  const attempts = expectedStatus === 200 ? 60 : 1;
+  const presentationExpiry = Date.parse(
+    paymentPayload?.payload?.presentation?.expiresAt ?? "",
+  );
+  let last;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const response = await fetch(url, {
+      method: "GET",
+      redirect: "error",
+      headers: {
+        [PAYMENT_SIGNATURE_HEADER]: encodePaymentSignatureHeader(paymentPayload),
+      },
+    });
+    const text = await response.text();
+    let body;
+    try {
+      body = text ? JSON.parse(text) : undefined;
+    } catch {
+      body = undefined;
+    }
+    last = { status: response.status, headers: response.headers, body };
+    if (response.status === expectedStatus) return last;
+    if (
+      expectedStatus === 200 &&
+      (response.status === 402 ||
+        response.status === 503 ||
+        response.status === 504) &&
+      body?.error !== "invalid_payload" &&
+      body?.error !== "invalid_signature" &&
+      body?.error !== "invalid_payment_requirements" &&
+      (!Number.isFinite(presentationExpiry) ||
+        Date.now() + 2_000 < presentationExpiry)
+    ) {
+      await sleep(2_000);
+      continue;
+    }
+    break;
+  }
+  throw new Error(
+    `hosted batch payment expected ${expectedStatus}, got ${last?.status}: ${JSON.stringify(last?.body)}`,
+  );
+}
+
+async function runBatch(input) {
+  const {
+    client,
+    server,
+    serverStore,
+    clientStore,
+    rpc,
+    sdk,
+    networkId,
+    addressCodec,
+    serverPrivateKeyHex,
+    fundingAddress,
+    spentOutpoints,
+    fundingVersionByTxid,
+    knownUtxos,
+    batchArtifactsByTxid,
+    batchGenesisByOutpoint,
+    batchTopUpsByOutpoint,
+    batchRecovery,
+    dataDir,
+    timeoutDaa,
+  } = input;
+  const firstResource = {
+    url: "https://live.kaspa-x402.local/batch/first",
+    description: "Live batch first request",
+  };
+  const firstHash = hash({ flow: "batch", request: 1 });
+  const first = await client.createPayment(
+    paymentRequiredFor(server, { routeAccess: "public",
+      resource: firstResource,
+      amount: BATCH_REQUEST_AMOUNT,
+      scheme: "batch-settlement",
+    }),
+    {
+      url: firstResource.url,
+      requestHash: firstHash,
+      paymentIdentifier: "live-batch-first-0001",
+    },
+  );
+  const firstResponse = await server.handlePaidRequest(
+    requestWithPayment(first.paymentPayload, { routeAccess: "public",
+      url: firstResource.url,
+      resource: firstResource,
+      scheme: "batch-settlement",
+      amount: BATCH_REQUEST_AMOUNT,
+      requestHash: firstHash,
+    }),
+    async () => ({
+      status: 200,
+      body: { ok: true },
+    }),
+  );
+  if (firstResponse.status !== 200)
+    throw new Error(
+      `batch deposit-voucher failed with status ${firstResponse.status}`,
+    );
+  const firstSettlement = decodeResponse(firstResponse);
+  const firstSettlementExtra = requireSettlementExtension(firstSettlement);
+  await client.applySettlement(first, firstSettlement);
+
+  const secondResource = {
+    ...firstResource,
+    description: "Live batch second request",
+  };
+  const secondHash = hash({ flow: "batch", request: 2 });
+  const second = await client.createPayment(
+    paymentRequiredFor(server, { routeAccess: "public",
+      resource: secondResource,
+      amount: BATCH_REQUEST_AMOUNT,
+      scheme: "batch-settlement",
+    }),
+    {
+      url: secondResource.url,
+      requestHash: secondHash,
+      paymentIdentifier: "live-batch-second-0002",
+    },
+  );
+  if (second.openedChannel)
+    throw new Error("batch voucher-only request opened a second channel");
+  const secondResponse = await server.handlePaidRequest(
+    requestWithPayment(second.paymentPayload, { routeAccess: "public",
+      url: secondResource.url,
+      resource: secondResource,
+      scheme: "batch-settlement",
+      amount: BATCH_REQUEST_AMOUNT,
+      requestHash: secondHash,
+    }),
+    async () => ({
+      status: 200,
+      body: { ok: true },
+    }),
+  );
+  if (secondResponse.status !== 200) {
+    throw new Error(
+      `batch voucher-only failed with status ${secondResponse.status}: ${JSON.stringify({ body: secondResponse.body, headers: secondResponse.headers })}`,
+    );
+  }
+  const secondSettlement = decodeResponse(secondResponse);
+  const secondSettlementExtra = requireSettlementExtension(secondSettlement);
+  await client.applySettlement(second, secondSettlement);
+
+  const [claimable] = await server.listClaimableChannels();
+  if (!claimable) throw new Error("no claimable batch channel found");
+  const oldVoucher = {
+    covenantId: claimable.covenantId,
+    authorizedCumulativeAmount: claimable.signedMaxClaimable,
+    signature: claimable.voucherSignature,
+  };
+  const claimAmount = BATCH_REQUEST_AMOUNT;
+  const claim = await server.executeClaim(claimable.channelId, claimAmount);
+  if (!claim.accepted) throw new Error("batch partial claim was not accepted");
+  const claimArtifact = batchArtifactsByTxid.get(
+    claim.transactionId.toLowerCase(),
+  );
+  if (!claimArtifact) throw new Error("batch claim artifact was not persisted");
+
+  const secondClaimAmount = BATCH_SECOND_CLAIM_AMOUNT.toString();
+  const replay = await attemptBatchReplay({
+    channel: claimable,
+    currentChannel: claim.channel,
+    oldVoucher,
+    claimAmount: secondClaimAmount,
+    rpc,
+    sdk,
+    networkId,
+    serverPrivateKeyHex,
+  });
+  if (!replay.rejected) throw new Error("spent batch head replay was accepted");
+
+  const secondClaim = await server.executeClaim(
+    claimable.channelId,
+    secondClaimAmount,
+  );
+  if (!secondClaim.accepted) {
+    throw new Error("second same-voucher batch partial claim was not accepted");
+  }
+  const secondClaimArtifact = batchArtifactsByTxid.get(
+    secondClaim.transactionId.toLowerCase(),
+  );
+  if (!secondClaimArtifact) {
+    throw new Error("second batch claim artifact was not persisted");
+  }
+
+  const topUpResource = {
+    ...firstResource,
+    description: "Live batch client-authorized top-up admission",
+  };
+  const topUpHash = hash({ flow: "batch", request: 3, transition: "top-up" });
+  const topUpPayment = await client.createPayment(
+    paymentRequiredFor(server, { routeAccess: "public",
+      resource: topUpResource,
+      amount: BATCH_TOP_UP_REQUEST_AMOUNT,
+      scheme: "batch-settlement",
+      channel: secondClaim.channel,
+    }),
+    {
+      url: topUpResource.url,
+      requestHash: topUpHash,
+      paymentIdentifier: "live-batch-top-up-0003",
+    },
+  );
+  if (
+    topUpPayment.openedChannel === true ||
+    topUpPayment.paymentPayload.payload.type !== "deposit-voucher"
+  ) {
+    throw new Error("batch top-up did not reuse the existing covenant lane");
+  }
+  const topUpProof = topUpPayment.channel?.lastTopUpEvidence;
+  if (!topUpProof || topUpProof.authorizedSuccessorCount !== 1) {
+    throw new Error("batch top-up singleton successor proof failed");
+  }
+  const topUpArtifact = batchArtifactsByTxid.get(
+    topUpProof.successorOutpoint.txid.toLowerCase(),
+  );
+  if (!topUpArtifact)
+    throw new Error("batch top-up artifact was not persisted");
+  const topUpTransitionHead = batchReportHead(topUpPayment.channel);
+  const topUpResponse = await server.handlePaidRequest(
+    requestWithPayment(topUpPayment.paymentPayload, { routeAccess: "public",
+      url: topUpResource.url,
+      resource: topUpResource,
+      scheme: "batch-settlement",
+      amount: BATCH_TOP_UP_REQUEST_AMOUNT,
+      requestHash: topUpHash,
+    }),
+    async () => ({
+      status: 200,
+      body: { ok: true, transition: "top-up-admitted" },
+      chargedAmount: BATCH_TOP_UP_REQUEST_AMOUNT,
+    }),
+  );
+  if (topUpResponse.status !== 200) {
+    throw new Error(
+      `batch top-up admission failed with status ${topUpResponse.status}`,
+    );
+  }
+  const topUpSettlement = decodeResponse(topUpResponse);
+  const topUpSettlementExtra = requireSettlementExtension(topUpSettlement);
+  await client.applySettlement(topUpPayment, topUpSettlement);
+  const toppedUpChannel = await serverStore.loadChannel(claimable.channelId);
+  if (!toppedUpChannel)
+    throw new Error("admitted batch top-up state is missing");
+  const restartReload = await verifyBatchRecoveryReload({
+    dataDir,
+    sdk,
+    networkId,
+    clientStore,
+    serverStore,
+    batchRecovery,
+    expectedChannelId: claimable.channelId,
+    expectedGenesisOutpoint: first.channel.activeOutpoint,
+    expectedTopUpOutpoint: topUpProof.successorOutpoint,
+  });
+
+  await waitForDaa(rpc, timeoutDaa + 10n, async () => {
+    await client.reconcileChannel(claimable.channelId);
+    await server.reconcileChannel(claimable.channelId);
+  });
+  const refundExecution = await client.refundChannel(claimable.channelId);
+  if (!refundExecution.accepted) {
+    throw new Error("batch refund did not reach accepted finality");
+  }
+  const refundArtifact = batchArtifactsByTxid.get(
+    refundExecution.transactionId.toLowerCase(),
+  );
+  if (!refundArtifact || refundArtifact.kind !== "batch-refund") {
+    throw new Error("batch refund artifact was not persisted");
+  }
+  const refundRecovery = await verifyBatchRefundRecoveryReload({
+    dataDir,
+    clientStore,
+    batchRecovery,
+    expectedChannelId: claimable.channelId,
+    expectedTransactionId: refundExecution.transactionId,
+  });
+  const refundServerInfo = await rpc.getServerInfo();
+  const observedRefundDaaScore = String(refundServerInfo.virtualDaaScore);
+  if (
+    BigInt(observedRefundDaaScore) <=
+    BigInt(refundArtifact.transaction.lockTime)
+  ) {
+    throw new Error("accepted batch refund lacks mature DAA evidence");
+  }
+  const refundedServerChannel = await server.reconcileChannel(
+    claimable.channelId,
+  );
+  if (refundedServerChannel.status !== "refunded") {
+    throw new Error("server did not persist the terminal refunded lineage");
+  }
+  const refund = {
+    operation: "refund",
+    covenantId: toppedUpChannel.covenantId,
+    txid: refundExecution.transactionId,
+    txVersion: 1,
+    txVersionSource: ADAPTER_SUBMITTED_TX_VERSION_SOURCE,
+    finality: refundExecution.finality,
+    refundAddress: fundingAddress,
+    inputAmountSompi: refundArtifact.transaction.inputs[0].utxo.amount,
+    refundAmountSompi: refundArtifact.fee.refundOutputAmount,
+    feeSompi: refundArtifact.fee.amount,
+    outputIndex: 0,
+    timeoutDaa: toppedUpChannel.channelConfig.refundTimeoutDaa,
+    lockTimeDaa: refundArtifact.transaction.lockTime,
+    observedDaaScore: observedRefundDaaScore,
+    terminal: true,
+    successorCovenantOutputCount: 0,
+    compute: refundArtifact.compute,
+    recovery: refundRecovery,
+    clientState: refundExecution.channel.status,
+    serverState: refundedServerChannel.status,
+  };
+
+  const genesisRecord = batchGenesisByOutpoint.get(
+    outpointKey(first.channel.activeOutpoint),
+  );
+  if (!genesisRecord)
+    throw new Error("verified batch genesis record is missing");
+  const depositState = batchReportState(
+    first.channel,
+    firstSettlementExtra.channelState,
+  );
+  const voucherOnlyState = batchReportState(
+    second.channel,
+    secondSettlementExtra.channelState,
+  );
+  const depositVoucher = voucherProof(
+    first.channel.config.network,
+    first.paymentPayload.payload.voucher,
+  );
+  const latestVoucher = voucherProof(second.channel.config.network, oldVoucher);
+  const claimHeadBefore = batchReportHead(claimable);
+  const claimHeadAfter = batchReportHead(claim.channel);
+  const secondClaimHeadAfter = batchReportHead(secondClaim.channel);
+  const topUpHeadAfter = topUpTransitionHead;
+  const topUpAdmissionState = batchReportState(
+    topUpPayment.channel,
+    topUpSettlementExtra.channelState,
+  );
+  refund.headBefore = topUpHeadAfter;
+
+  return {
+    claimReserveSompi: DEFAULT_FEE_SOMPI.toString(),
+    restartReload,
+    deposit: {
+      txid: first.channel.activeOutpoint.txid,
+      ...versionEvidenceForTxid(
+        fundingVersionByTxid,
+        first.channel.activeOutpoint.txid,
+      ),
+      channelId: first.channel.id,
+      settlementCommitment: firstSettlementExtra.commitmentId,
+      finality: "accepted",
+      chargedAmount: firstSettlementExtra.chargedAmount,
+      settlementAmount: firstSettlement.amount,
+      extensionChargedAmount: firstSettlementExtra.chargedAmount,
+      chargedCumulativeBefore: "0",
+      state: depositState,
+      voucherProof: depositVoucher,
+      genesis: {
+        verifiedSingletonGenesis: true,
+        covenantId: genesisRecord.evidence.covenantId,
+        authorizingInputOutpoint: genesisRecord.evidence.authorizingInput,
+        authorizedOutputCount: genesisRecord.evidence.authorizedOutputCount,
+        totalOutputCount: genesisRecord.evidence.totalOutputCount,
+        authorizedOutputIndex: first.channel.activeOutpoint.index,
+        outpoint: first.channel.activeOutpoint,
+        scriptPublicKey: first.channel.activeScriptPublicKey,
+        fundingAmount: first.channel.fundingAmount,
+        fundingInputTotalSompi: genesisRecord.artifact.transaction.inputs
+          .reduce((total, input) => total + BigInt(input.utxo.amount), 0n)
+          .toString(),
+        feeSompi: genesisRecord.artifact.fee.amount,
+        initialClaimedCumulativeAmount: "0",
+        inputComputeBudgets: genesisRecord.artifact.transaction.inputs.map(
+          ({ computeBudget }) => computeBudget,
+        ),
+      },
+    },
+    voucherOnly: {
+      openedChannel: second.openedChannel,
+      channelId: second.channel.id,
+      settlementCommitment: secondSettlementExtra.commitmentId,
+      chargedAmount: secondSettlementExtra.chargedAmount,
+      settlementAmount: secondSettlement.amount,
+      extensionChargedAmount: secondSettlementExtra.chargedAmount,
+      chargedCumulativeBefore:
+        firstSettlementExtra.channelState.authorizedCumulativeAmount,
+      state: voucherOnlyState,
+      voucherProof: latestVoucher,
+    },
+    claim: {
+      operation: "claim",
+      covenantId: claimable.covenantId,
+      txid: claim.transactionId,
+      txVersion: 1,
+      txVersionSource: ADAPTER_SUBMITTED_TX_VERSION_SOURCE,
+      finality: claim.finality,
+      headBefore: claimHeadBefore,
+      headAfter: claimHeadAfter,
+      successorCovenantOutputCount: 1,
+      claimAmountSompi: claimAmount,
+      serverOutputAmountSompi: (
+        BigInt(claimAmount) - DEFAULT_FEE_SOMPI
+      ).toString(),
+      feeSompi: DEFAULT_FEE_SOMPI.toString(),
+      chargedCumulativeAmount: claim.channel.chargedCumulativeAmount,
+      signedMaxClaimable: claim.channel.signedMaxClaimable,
+      voucherProof: latestVoucher,
+      compute: claimArtifact.compute,
+    },
+    secondAcceptedClaim: {
+      operation: "claim",
+      covenantId: secondClaim.channel.covenantId,
+      txid: secondClaim.transactionId,
+      txVersion: 1,
+      txVersionSource: ADAPTER_SUBMITTED_TX_VERSION_SOURCE,
+      finality: secondClaim.finality,
+      headBefore: claimHeadAfter,
+      headAfter: secondClaimHeadAfter,
+      successorCovenantOutputCount: 1,
+      claimAmountSompi: secondClaimAmount,
+      serverOutputAmountSompi: (
+        BigInt(secondClaimAmount) - DEFAULT_FEE_SOMPI
+      ).toString(),
+      feeSompi: DEFAULT_FEE_SOMPI.toString(),
+      chargedCumulativeAmount: secondClaim.channel.chargedCumulativeAmount,
+      signedMaxClaimable: secondClaim.channel.signedMaxClaimable,
+      voucherProof: latestVoucher,
+      compute: secondClaimArtifact.compute,
+    },
+    topUp: {
+      operation: "top-up",
+      covenantId: toppedUpChannel.covenantId,
+      txid: topUpArtifact.transactionId,
+      txVersion: 1,
+      txVersionSource: ADAPTER_SUBMITTED_TX_VERSION_SOURCE,
+      finality: "accepted",
+      headBefore: secondClaimHeadAfter,
+      headAfter: topUpHeadAfter,
+      successorCovenantOutputCount: 1,
+      addedAmountSompi: (
+        BigInt(topUpTransitionHead.fundingAmount) -
+        BigInt(secondClaim.channel.fundingAmount)
+      ).toString(),
+      chargedCumulativeAmount: secondClaim.channel.chargedCumulativeAmount,
+      signedMaxClaimable: secondClaim.channel.signedMaxClaimable,
+      voucherProof: latestVoucher,
+      compute: topUpArtifact.compute,
+      admission: {
+        openedChannel: topUpPayment.openedChannel,
+        settlementCommitment: topUpSettlementExtra.commitmentId,
+        chargedAmount: topUpSettlementExtra.chargedAmount,
+        settlementAmount: topUpSettlement.amount,
+        extensionChargedAmount: topUpSettlementExtra.chargedAmount,
+        chargedCumulativeBefore: secondClaim.channel.chargedCumulativeAmount,
+        state: topUpAdmissionState,
+        voucherProof: voucherProof(
+          topUpPayment.channel.config.network,
+          topUpPayment.paymentPayload.payload.voucher,
+        ),
+      },
+    },
+    replay: {
+      kind: "stale-head",
+      covenantId: claimable.covenantId,
+      spentOutpoint: claimable.activeOutpoint,
+      spentScriptPublicKey: claimable.activeScriptPublicKey,
+      attemptedInputOutpoint: replay.attemptedInputOutpoint,
+      attemptedTransactionId: replay.attemptedTransactionId,
+      observedCurrentOutpoint: claim.channel.activeOutpoint,
+      attemptedTxVersion: replay.attemptedTxVersion,
+      attemptedTxVersionSource: replay.attemptedTxVersionSource,
+      voucherProof: latestVoucher,
+      rejected: replay.rejected,
+      rpcSubmissionAttempted: replay.rpcSubmissionAttempted,
+      definitiveNodeRejection: replay.definitiveNodeRejection,
+      spentOutpointAbsent: replay.spentOutpointAbsent,
+      currentOutpointPresent: replay.currentOutpointPresent,
+      finality: "rejected",
+      reason: replay.reason,
+    },
+    refund,
+  };
+}
+
+function batchReportState(channel, settlementState) {
+  return {
+    covenantId: channel.covenantId,
+    activeOutpoint: structuredClone(channel.activeOutpoint),
+    activeScriptPublicKey: channel.activeScriptPublicKey,
+    fundingAmount: channel.fundingAmount,
+    chargedCumulativeAmount: settlementState.authorizedCumulativeAmount,
+    claimedCumulativeAmount: settlementState.claimedCumulativeAmount,
+    signedMaxClaimable: settlementState.authorizedCumulativeAmount,
+  };
+}
+
+function batchReportHead(channel) {
+  return {
+    outpoint: structuredClone(channel.activeOutpoint),
+    scriptPublicKey: channel.activeScriptPublicKey,
+    fundingAmount: channel.fundingAmount,
+    claimedCumulativeAmount: channel.claimedCumulativeAmount,
+  };
+}
+
+function voucherProof(network, voucher) {
+  return {
+    covenantId: voucher.covenantId,
+    amount: voucher.authorizedCumulativeAmount,
+    signature: voucher.signature,
+    digest: voucherDigest({
+      network,
+      covenantId: voucher.covenantId,
+      authorizedCumulativeAmount: voucher.authorizedCumulativeAmount,
+    }),
+  };
+}
+
+const batchComputeProfiles = new Map();
+
+function batchComputeProfile(operation) {
+  const cached = batchComputeProfiles.get(operation);
+  if (cached) return cached;
+  const vectorPath = path.join(
+    REPO_ROOT,
+    "vectors",
+    "tx-v1",
+    `batch-${operation}.json`,
+  );
+  if (!fs.existsSync(vectorPath)) {
+    throw new Error(
+      `missing v1 RC2 consensus vector ${path.relative(REPO_ROOT, vectorPath)}`,
+    );
+  }
+  const vector = JSON.parse(fs.readFileSync(vectorPath, "utf8"));
+  const computeBudget = Number(
+    vector.input?.computeBudget ?? vector.expected?.compute?.computeBudget,
+  );
+  const scriptUnitsEstimate = Number(
+    vector.input?.scriptUnitsEstimate ??
+      vector.expected?.compute?.scriptUnitsEstimate,
+  );
+  const scriptUnitAllowanceValue = scriptUnitAllowance(computeBudget);
+  if (
+    !Number.isSafeInteger(scriptUnitsEstimate) ||
+    scriptUnitsEstimate < 0 ||
+    vector.expected?.compute?.scriptUnitAllowance !== scriptUnitAllowanceValue
+  ) {
+    throw new Error(`invalid v1 RC2 ${operation} compute evidence`);
+  }
+  const profile = {
+    computeBudget,
+    scriptUnitsEstimate,
+    scriptUnitAllowance: scriptUnitAllowanceValue,
+    source: path.relative(REPO_ROOT, vectorPath),
+  };
+  batchComputeProfiles.set(operation, profile);
+  return profile;
+}
+
+async function buildPreparedGenesis(input) {
+  const {
+    request,
+    rpc,
+    sdk,
+    network,
+    fundingPrivateKeyHex,
+    fundingAddress,
+    schnorr,
+    spentOutpoints,
+    knownUtxos,
+    batchArtifactsByTxid,
+    batchGenesisByOutpoint,
+    pendingBroadcasts,
+    dataDir,
+  } = input;
+  const requestedMinimum = BigInt(request.amount);
+  const fee = DEFAULT_FEE_SOMPI;
+  const requiredInputAmount = requestedMinimum + fee;
+  let funding = await selectFundingUtxo(
+    rpc,
+    fundingAddress,
+    requiredInputAmount,
+    spentOutpoints,
+  );
+  if (BigInt(funding.amount) > requiredInputAmount) {
+    const split = await sendFromFunding({
+      rpc,
+      sdk,
+      networkId: kaspaNetworkId(network),
+      fundingPrivateKey: new sdk.PrivateKey(fundingPrivateKeyHex),
+      fundingAddress,
+      spentOutpoints,
+      outputs: [{ address: fundingAddress, amount: requiredInputAmount }],
+    });
+    funding = await waitForAddressOutpoint({
+      rpc,
+      address: fundingAddress,
+      txid: split.txid,
+      amount: requiredInputAmount,
+    });
+  }
+  const escrowAmount = requestedMinimum;
+  const fundingScriptPublicKey = funding.scriptPublicKey;
+  const params = escrowParamsFromChannelConfig(
+    request.channelConfig,
+    {
+      scriptPublicKeyForAddress(address) {
+        return serializeSdkScriptPublicKey(sdk.payToAddressScript(address));
+      },
+    },
+    "0",
+  );
+  const redeemScript = buildEscrowRedeemScript(params);
+  const expectedScriptPublicKey = serializedScriptPublicKey(
+    escrowScriptPublicKey(params),
+  );
+  if (
+    expectedScriptPublicKey.toLowerCase() !==
+    request.escrowScriptPublicKey.toLowerCase()
+  ) {
+    throw new Error("batch genesis script does not match channel terms");
+  }
+  const base = {
+    fundingInputs: [
+      {
+        previousOutpoint: funding.outpoint,
+        amount: funding.amount,
+        scriptPublicKey: fundingScriptPublicKey,
+        signature: "00".repeat(64),
+        computeBudget: TX_V1_P2PK_COMPUTE_BUDGET,
+      },
+    ],
+    escrowAmount: escrowAmount.toString(),
+    escrowScriptPublicKey: request.escrowScriptPublicKey,
+    escrowRedeemScript: redeemScript,
+    initialClaimedCumulativeAmount: "0",
+    fee: fee.toString(),
+  };
+  const unsigned = buildBatchGenesisTxV1Artifact(base);
+  const signature = signRawSchnorr(
+    schnorr,
+    unsigned.sighashes[0].digest,
+    fundingPrivateKeyHex,
+  );
+  const artifact = buildBatchGenesisTxV1Artifact({
+    ...base,
+    fundingInputs: [{ ...base.fundingInputs[0], signature }],
+    mass: unsigned.transaction.mass,
+  });
+  const txid = artifact.transactionId;
+  markOutpointSpent(spentOutpoints, funding.outpoint);
+  const successor = {
+    outpoint: structuredClone(artifact.escrow.outpoint),
+    covenantId: artifact.covenantId,
+    amount: artifact.escrow.amount,
+    scriptPublicKey: artifact.escrow.scriptPublicKey,
+  };
+  const authorizedOutputCount = artifact.transaction.outputs.filter(
+    (output) =>
+      output.covenant?.covenantId === artifact.covenantId &&
+      output.covenant.authorizingInput === 0,
+  ).length;
+  const evidence = {
+    covenantId: artifact.covenantId,
+    authorizingInput: structuredClone(funding.outpoint),
+    genesisOutpoint: structuredClone(successor.outpoint),
+    genesisScriptPublicKey: successor.scriptPublicKey,
+    genesisAmount: successor.amount,
+    authorizedOutputCount,
+    totalOutputCount: artifact.transaction.outputs.length,
+  };
+  const record = { artifact, evidence, address: request.escrowAddress };
+  pendingBroadcasts.set(artifact.serializedTransaction, {
+    kind: "batch-artifact",
+    operation: "genesis",
+    artifact,
+    submitted: false,
+    accepted: false,
+    spentOutpoint: structuredClone(funding.outpoint),
+    spentOutpoints: [structuredClone(funding.outpoint)],
+    successorAddress: request.escrowAddress,
+    successorOutpoint: structuredClone(successor.outpoint),
+    successorAmount: successor.amount,
+    successorScriptPublicKey: successor.scriptPublicKey,
+    covenantId: successor.covenantId,
+    channelId: request.channelId,
+  });
+  batchArtifactsByTxid.set(txid.toLowerCase(), artifact);
+  batchGenesisByOutpoint.set(outpointKey(successor.outpoint), record);
+  persistBatchArtifact(dataDir, artifact);
+  return { artifact, successor, evidence };
+}
+
+async function buildPreparedTopUp(input) {
+  const {
+    request,
+    rpc,
+    sdk,
+    fundingPrivateKeyHex,
+    providerPrivateKeyHex,
+    fundingAddress,
+    schnorr,
+    spentOutpoints,
+    knownUtxos,
+    batchArtifactsByTxid,
+    batchTopUpsByOutpoint,
+    pendingBroadcasts,
+    dataDir,
+  } = input;
+  const channel = request.channel;
+  const activeAmount = BigInt(channel.fundingAmount);
+  const successorAmount = BigInt(request.targetFundingAmount);
+  if (successorAmount <= activeAmount)
+    throw new Error("batch top-up target must exceed the current head");
+  const fee = DEFAULT_FEE_SOMPI;
+  const addedAmount = successorAmount - activeAmount;
+  const funding = await selectFundingUtxo(
+    rpc,
+    fundingAddress,
+    addedAmount + fee,
+    spentOutpoints,
+  );
+  const changeAmount = BigInt(funding.amount) - addedAmount - fee;
+  const refundScriptPublicKey = serializeSdkScriptPublicKey(
+    sdk.payToAddressScript(fundingAddress),
+  );
+  const activeParams = escrowParams(channel, {
+    scriptPublicKeyForAddress(address) {
+      return serializeSdkScriptPublicKey(sdk.payToAddressScript(address));
+    },
+  });
+  const activeRedeemScript = buildEscrowRedeemScript(activeParams);
+  const compute = batchComputeProfile("top-up");
+  const base = {
+    activeOutpoint: channel.activeOutpoint,
+    activeAmount: channel.fundingAmount,
+    activeScriptPublicKey: channel.activeScriptPublicKey,
+    activeRedeemScript,
+    covenantId: channel.covenantId,
+    claimedCumulativeAmount: channel.claimedCumulativeAmount,
+    successorAmount: request.targetFundingAmount,
+    successorScriptPublicKey: channel.activeScriptPublicKey,
+    successorRedeemScript: activeRedeemScript,
+    clientSignature: "00".repeat(65),
+    providerSignature: "00".repeat(65),
+    fundingInputs: [
+      {
+        previousOutpoint: funding.outpoint,
+        amount: funding.amount,
+        scriptPublicKey: funding.scriptPublicKey,
+        signature: "00".repeat(64),
+        computeBudget: TX_V1_P2PK_COMPUTE_BUDGET,
+      },
+    ],
+    changeOutputs:
+      changeAmount === 0n
+        ? []
+        : [
+            {
+              amount: changeAmount.toString(),
+              scriptPublicKey: refundScriptPublicKey,
+              covenant: null,
+            },
+          ],
+    expectedRefundScriptPublicKeyHash: sha256Hex(
+      hexToBytes(refundScriptPublicKey),
+    ),
+    fee: fee.toString(),
+    computeBudget: compute.computeBudget,
+    scriptUnitsEstimate: compute.scriptUnitsEstimate,
+  };
+  const unsigned = buildBatchTopUpTxV1Artifact(base);
+  // [gateway port] P-M2: the escrow covenant does not pin the sighash type, so we refuse to sign any top-up
+  // sighash that is not SIGHASH_ALL (outputs + inputs fully committed).
+  for (const sh of unsigned.sighashes) if (sh.hashType != null && !/^(sig_?hash_?)?all$/i.test(String(sh.hashType)))
+    throw new Error(`refusing to sign top-up with sighash ${sh.hashType}; only SIGHASH_ALL is allowed`);
+  const clientSignature = signTransactionSchnorr(
+    schnorr,
+    unsigned.sighashes[0].digest,
+    channel.clientPrivateKey,
+  );
+  const providerSignature = signTransactionSchnorr(
+    schnorr,
+    unsigned.sighashes[0].digest,
+    providerPrivateKeyHex,
+  );
+  const fundingSignature = signRawSchnorr(
+    schnorr,
+    unsigned.sighashes[1].digest,
+    fundingPrivateKeyHex,
+  );
+  const artifact = buildBatchTopUpTxV1Artifact({
+    ...base,
+    clientSignature,
+    providerSignature,
+    fundingInputs: [{ ...base.fundingInputs[0], signature: fundingSignature }],
+    mass: unsigned.transaction.mass,
+  });
+  const txid = artifact.transactionId;
+  markOutpointSpent(spentOutpoints, channel.activeOutpoint);
+  markOutpointSpent(spentOutpoints, funding.outpoint);
+  const successorAddress = scriptAddressFromSerialized(
+    sdk,
+    artifact.continuation.scriptPublicKey,
+    input.networkId,
+  );
+  const successor = {
+    outpoint: structuredClone(artifact.continuation.outpoint),
+    covenantId: artifact.continuation.covenantId,
+    amount: artifact.continuation.amount,
+    scriptPublicKey: artifact.continuation.scriptPublicKey,
+  };
+  const evidence = {
+    covenantId: channel.covenantId,
+    spentOutpoint: structuredClone(channel.activeOutpoint),
+    successorOutpoint: structuredClone(successor.outpoint),
+    successorScriptPublicKey: successor.scriptPublicKey,
+    successorAmount: successor.amount,
+    authorizedSuccessorCount: 1,
+    authorizingInput: 0,
+  };
+  pendingBroadcasts.set(artifact.serializedTransaction, {
+    kind: "batch-artifact",
+    operation: "top-up",
+    artifact,
+    submitted: false,
+    accepted: false,
+    spentOutpoint: structuredClone(channel.activeOutpoint),
+    spentOutpoints: [
+      structuredClone(channel.activeOutpoint),
+      structuredClone(funding.outpoint),
+    ],
+    successorAddress,
+    successorOutpoint: structuredClone(successor.outpoint),
+    successorAmount: successor.amount,
+    successorScriptPublicKey: successor.scriptPublicKey,
+    covenantId: successor.covenantId,
+    channelId: channel.id,
+  });
+  batchArtifactsByTxid.set(txid.toLowerCase(), artifact);
+  batchTopUpsByOutpoint.set(outpointKey(successor.outpoint), {
+    artifact,
+    evidence,
+    address: successorAddress,
+  });
+  persistBatchArtifact(dataDir, artifact);
+  return { artifact, successor, evidence };
+}
+
+function makeFundingProvider(input) {
+  const {
+    rpc,
+    sdk,
+    chain,
+    networkId,
+    network,
+    fundingPrivateKey,
+    fundingPrivateKeyHex,
+    providerPrivateKeyHex,
+    fundingAddress,
+    fundingPublicKey,
+    knownUtxos,
+    spentOutpoints,
+    fundingVersionByTxid,
+    schnorr,
+    pendingBroadcasts,
+    batchArtifactsByTxid,
+    batchGenesisByOutpoint,
+    batchTopUpsByOutpoint,
+    dataDir,
+  } = input;
+  const exactAttempts = loadPersistedExactPaymentAttempts(
+    dataDir,
+    spentOutpoints,
+  );
+  let exactQueue = Promise.resolve();
+  const runExact = (operation) => {
+    const result = exactQueue.then(operation, operation);
+    exactQueue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  };
+  return {
+    networkId: network,
+    sourceKind: "hot-wallet",
+    async authorizeBatchPayment({ intentDigest }) {
+      return { intentDigest };
+    },
+    async getPublicIdentity() {
+      return { address: fundingAddress, publicKey: fundingPublicKey };
+    },
+    async prepareEscrowDeposit(request) {
+      const genesis = await buildPreparedGenesis({
+        request,
+        rpc,
+        sdk,
+        networkId,
+        network,
+        fundingPrivateKeyHex,
+        fundingAddress,
+        schnorr,
+        spentOutpoints,
+        knownUtxos,
+        batchArtifactsByTxid,
+        batchGenesisByOutpoint,
+        pendingBroadcasts,
+        dataDir,
+      });
+      rememberFundingVersion(fundingVersionByTxid, {
+        txid: genesis.artifact.transactionId,
+        txVersion: 1,
+        txVersionSource: ADAPTER_SUBMITTED_TX_VERSION_SOURCE,
+      });
+      return {
+        transaction: genesis.artifact.serializedTransaction,
+        transactionId: genesis.artifact.transactionId,
+        inputOutpoints: genesis.artifact.transaction.inputs.map((input) =>
+          structuredClone(input.previousOutpoint),
+        ),
+        successor: genesis.successor,
+        fundingSource: "hot-wallet",
+      };
+    },
+    async prepareEscrowTopUp(request) {
+      const topUp = await buildPreparedTopUp({
+        request,
+        rpc,
+        sdk,
+        networkId,
+        fundingPrivateKeyHex,
+        providerPrivateKeyHex,
+        fundingAddress,
+        schnorr,
+        spentOutpoints,
+        knownUtxos,
+        batchArtifactsByTxid,
+        batchTopUpsByOutpoint,
+        pendingBroadcasts,
+        dataDir,
+      });
+      return {
+        transaction: topUp.artifact.serializedTransaction,
+        transactionId: topUp.artifact.transactionId,
+        inputOutpoints: topUp.artifact.transaction.inputs.map((input) =>
+          structuredClone(input.previousOutpoint),
+        ),
+        successor: topUp.successor,
+        fundingSource: "hot-wallet",
+      };
+    },
+    async payExactTransaction(request) {
+      return runExact(() =>
+        withExactPaymentStoreLock(dataDir, async () => {
+          const persisted = loadPersistedExactPaymentAttempts(
+            dataDir,
+            spentOutpoints,
+          );
+          exactAttempts.clear();
+          for (const [attemptId, attempt] of persisted)
+            exactAttempts.set(attemptId, attempt);
+          const key = request.attemptId.toLowerCase();
+          const intentHash = request.intentHash.toLowerCase();
+          const existing = exactAttempts.get(key);
+          if (existing) {
+            if (existing.intentHash !== intentHash)
+              throw new Error("exact payment attempt intent changed");
+            return structuredClone(existing.result);
+          }
+          const result = await buildExactTransaction({
+            rpc,
+            sdk,
+            fundingPrivateKey,
+            fundingPrivateKeyHex,
+            fundingAddress,
+            schnorr,
+            spentOutpoints,
+            request,
+          });
+          const headKey = request.head
+            ? outpointKey(request.head.expectedHeadOutpoint)
+            : undefined;
+          const record = {
+            format: "kaspa-x402-exact-provider-attempt-v1",
+            attemptId: key,
+            intentHash,
+            result: structuredClone(result),
+            reservedOutpoints: result.inputOutpoints.filter(
+              (outpoint) => outpointKey(outpoint) !== headKey,
+            ),
+          };
+          persistExactPaymentAttempt(dataDir, record);
+          for (const outpoint of record.reservedOutpoints)
+            markOutpointSpent(spentOutpoints, outpoint);
+          exactAttempts.set(key, structuredClone(record));
+          return result;
+        }),
+      );
+    },
+    async finalizeExactPaymentAttempt(request) {
+      return runExact(() =>
+        withExactPaymentStoreLock(dataDir, async () => {
+          const persisted = loadPersistedExactPaymentAttempts(
+            dataDir,
+            spentOutpoints,
+          );
+          exactAttempts.clear();
+          for (const [attemptId, attempt] of persisted)
+            exactAttempts.set(attemptId, attempt);
+          const key = request.attemptId.toLowerCase();
+          const existing = exactAttempts.get(key);
+          if (!existing) return;
+          if (
+            existing.result.transactionId.toLowerCase() !==
+            request.transactionId.toLowerCase()
+          ) {
+            throw new Error(
+              "exact transaction id does not match provider attempt",
+            );
+          }
+          removeExactPaymentAttempt(dataDir, key);
+          exactAttempts.delete(key);
+          if (request.outcome === "absent") {
+            for (const outpoint of existing.reservedOutpoints)
+              spentOutpoints.delete(outpointKey(outpoint));
+          }
+        }),
+      );
+    },
+    async getUtxos(addresses) {
+      const utxos = [];
+      for (const address of addresses) {
+        const entries = await getAddressUtxos(rpc, address);
+        for (const utxo of entries) {
+          rememberUtxo(knownUtxos, utxo);
+          utxos.push(utxo);
+        }
+      }
+      return utxos;
+    },
+    async getUtxo(outpoint) {
+      return refreshKnownUtxo(rpc, knownUtxos, outpoint);
+    },
+    async verifyCovenantGenesis({ prepared, utxo }) {
+      const artifact = batchArtifactsByTxid.get(
+        prepared.transactionId.toLowerCase(),
+      );
+      if (
+        artifact?.kind !== "batch-genesis" ||
+        artifact.serializedTransaction !== prepared.transaction
+      ) {
+        return null;
+      }
+      return verifyPersistedBatchGenesis(batchGenesisByOutpoint, utxo);
+    },
+    async verifyCovenantTopUp({ previous, prepared, successor }) {
+      const artifact = batchArtifactsByTxid.get(
+        prepared.transactionId.toLowerCase(),
+      );
+      if (
+        artifact?.kind !== "batch-top-up" ||
+        artifact.serializedTransaction !== prepared.transaction
+      ) {
+        return null;
+      }
+      return verifyPersistedBatchTopUp(batchTopUpsByOutpoint, {
+        previous,
+        next: {
+          ...previous,
+          activeOutpoint: successor.outpoint,
+          activeScriptPublicKey: successor.scriptPublicKey,
+          fundingAmount: successor.amount,
+        },
+        utxo: successor,
+      });
+    },
+    async discoverCovenantLineage(request) {
+      return chain.discoverCovenantLineage(request);
+    },
+    async getVirtualDaaScore() {
+      const info = await rpc.getServerInfo();
+      return String(info.virtualDaaScore);
+    },
+    async sendTransaction(transaction) {
+      return chain.sendTransaction(transaction);
+    },
+    async estimateFees() {
+      return { feeSompi: DEFAULT_FEE_SOMPI.toString() };
+    },
+  };
+}
+
+function makeChainProvider({
+  rpc,
+  sdk,
+  addressCodec,
+  network,
+  knownUtxos,
+  spentOutpoints,
+  pendingBroadcasts,
+  dataDir,
+  batchArtifactsByTxid,
+  batchGenesisByOutpoint,
+  batchRecovery,
+  redactionSecrets,
+}) {
+  return {
+    async getUtxo(outpoint) {
+      return refreshKnownUtxo(rpc, knownUtxos, outpoint);
+    },
+    async verifyCovenantGenesis({ utxo }) {
+      return verifyPersistedBatchGenesis(batchGenesisByOutpoint, utxo);
+    },
+    async discoverCovenantLineage(request) {
+      return discoverLiveCovenantLineage({
+        rpc,
+        request,
+        batchArtifactsByTxid,
+      });
+    },
+    async getVirtualDaaScore() {
+      const info = await rpc.getServerInfo();
+      return String(info.virtualDaaScore);
+    },
+    async estimateClaimFee() {
+      return DEFAULT_FEE_SOMPI.toString();
+    },
+    async sendTransaction(transaction) {
+      const record = pendingBroadcasts.get(transaction);
+      if (record?.accepted) {
+        return {
+          transactionId: record.txid,
+          evidence: structuredClone(record.evidence),
+          finality: "accepted",
+        };
+      }
+      if (record?.kind === "batch-artifact") {
+        if (!record.submitted) {
+          record.startCheckpoint = await liveChainCheckpoint(rpc);
+          if (record.operation === "genesis" || record.operation === "top-up") {
+            const fundingAttempt =
+              await batchRecovery.clientStore?.loadFundingTransitionAttempt(
+                record.channelId,
+              );
+            if (
+              !fundingAttempt ||
+              fundingAttempt.status !== "pending" ||
+              fundingAttempt.kind !== record.operation ||
+              fundingAttempt.transaction !== transaction ||
+              fundingAttempt.transactionId.toLowerCase() !==
+                record.artifact.transactionId.toLowerCase()
+            ) {
+              throw new Error(
+                `batch ${record.operation} was not durably reserved before broadcast`,
+              );
+            }
+          }
+          if (
+            record.operation === "claim" &&
+            !batchRecovery.preBroadcastSnapshotFile
+          ) {
+            const openAttempt =
+              await batchRecovery.serverStore?.loadOpenClaimAttempt(
+                record.channelId,
+              );
+            if (!openAttempt || openAttempt.status !== "pending") {
+              throw new Error(
+                "batch claim was not durably reserved before broadcast",
+              );
+            }
+            const channelOperation =
+              await batchRecovery.serverStore?.loadChannelOperation(
+                record.channelId,
+              );
+            if (
+              !channelOperation ||
+              channelOperation.leaseId !== openAttempt.operationLeaseId
+            ) {
+              throw new Error(
+                "batch claim channel operation was not durably reserved before broadcast",
+              );
+            }
+            batchRecovery.preBroadcastSnapshotFile = persistBatchRecoveryRecord(
+              dataDir,
+              "claim-before-broadcast",
+              {
+                format: "kaspa-x402-v1-rc1-claim-before-broadcast-v1",
+                capturedAt: new Date().toISOString(),
+                clientChannels: await batchRecovery.clientStore.loadChannels(
+                  {},
+                ),
+                serverChannels: await batchRecovery.serverStore.listChannels(),
+                channelOperation,
+                attempt: openAttempt,
+                artifact: record.artifact,
+              },
+            );
+          }
+          if (
+            record.operation === "refund" &&
+            !batchRecovery.preBroadcastRefundSnapshotFile
+          ) {
+            const refundAttempt =
+              await batchRecovery.clientStore?.loadRefundAttempt(
+                record.channelId,
+              );
+            if (
+              !refundAttempt ||
+              refundAttempt.status !== "pending" ||
+              refundAttempt.transaction !== transaction ||
+              refundAttempt.transactionId.toLowerCase() !==
+                record.artifact.transactionId.toLowerCase()
+            ) {
+              throw new Error(
+                "batch refund was not durably reserved before broadcast",
+              );
+            }
+            batchRecovery.preBroadcastRefundSnapshotFile =
+              persistBatchRecoveryRecord(dataDir, "refund-before-broadcast", {
+                format: "kaspa-x402-v1-rc1-refund-before-broadcast-v1",
+                capturedAt: new Date().toISOString(),
+                clientChannels: await batchRecovery.clientStore.loadChannels(
+                  {},
+                ),
+                attempt: refundAttempt,
+                artifact: record.artifact,
+              });
+          }
+          const txid = await submitBatchArtifact(rpc, sdk, record.artifact);
+          if (
+            txid.toLowerCase() !== record.artifact.transactionId.toLowerCase()
+          ) {
+            throw new Error(
+              "node returned a different prepared batch transaction id",
+            );
+          }
+          record.txid = txid;
+          record.submitted = true;
+          for (const spentOutpoint of record.spentOutpoints ?? [
+            record.spentOutpoint,
+          ]) {
+            markOutpointSpent(spentOutpoints, spentOutpoint);
+            knownUtxos.delete(outpointKey(spentOutpoint));
+          }
+        }
+        if (record.terminal) {
+          const refundUtxo = await waitForAddressOutpoint({
+            rpc,
+            address: record.refundAddress,
+            txid: record.txid,
+            index: record.refundOutputIndex,
+            amount: BigInt(record.refundOutputAmount),
+            scriptPublicKey: record.refundScriptPublicKey,
+          });
+          record.refundUtxo = refundUtxo;
+        } else {
+          const successor = await waitForAddressOutpoint({
+            rpc,
+            address: record.successorAddress,
+            txid: record.txid,
+            index: record.successorOutpoint.index,
+            amount: BigInt(record.successorAmount),
+            scriptPublicKey: record.successorScriptPublicKey,
+            covenantId: record.covenantId,
+          });
+          record.successorUtxo = successor;
+        }
+        record.evidence = await waitForAcceptedTransactionEvidence({
+          rpc,
+          transactionId: record.txid,
+          fromCheckpoint: record.startCheckpoint,
+          minConfirmationCount: CONFIRMATION_THRESHOLD,
+        });
+        if (record.refundUtxo) {
+          rememberUtxo(knownUtxos, {
+            ...record.refundUtxo,
+            acceptance: record.evidence,
+          });
+        }
+        if (record.successorUtxo) {
+          rememberUtxo(knownUtxos, {
+            ...record.successorUtxo,
+            acceptance: record.evidence,
+          });
+        }
+        batchArtifactsByTxid.set(
+          record.artifact.transactionId.toLowerCase(),
+          record.artifact,
+        );
+        record.accepted = true;
+        return {
+          transactionId: record.txid,
+          evidence: structuredClone(record.evidence),
+          finality: "accepted",
+        };
+      }
+      if (record?.submitted && record.kind === "exact-transaction") {
+        await waitForAddressOutpoint({
+          rpc,
+          address: record.paymentAddress,
+          txid: record.txid,
+          index: record.paymentOutputIndex,
+          amount: BigInt(record.paymentAmount),
+          scriptPublicKey: record.paymentScriptPublicKey,
+        });
+        record.evidence = await waitForAcceptedTransactionEvidence({
+          rpc,
+          transactionId: record.txid,
+          fromCheckpoint: record.startCheckpoint,
+          minConfirmationCount: CONFIRMATION_THRESHOLD,
+        });
+        record.accepted = true;
+        return {
+          transactionId: record.txid,
+          evidence: structuredClone(record.evidence),
+          finality: "accepted",
+        };
+      }
+      if (record?.submitted && record.txid) {
+        if (!record.evidence) {
+          throw new Error("persisted broadcast is missing selected-chain evidence");
+        }
+        return {
+          transactionId: record.txid,
+          evidence: structuredClone(record.evidence),
+          finality: "accepted",
+        };
+      }
+      const parsed = sdk.Transaction.deserializeFromSafeJSON(transaction);
+      const paymentEvidence = exactTransactionPaymentEvidence({
+        transaction: parsed,
+        addressCodec,
+        network,
+      });
+      const startCheckpoint = await liveChainCheckpoint(rpc);
+      let transactionId;
+      try {
+        ({ transactionId } = await rpc.submitTransaction({
+          transaction: parsed,
+          allowOrphan: false,
+        }));
+      } catch (error) {
+        fs.writeFileSync(
+          path.join(dataDir, "last-exact-broadcast-error.json"),
+          `${JSON.stringify(
+            {
+              generatedAt: new Date().toISOString(),
+              transactionId: parsed.id,
+              message: sanitizeProofOutputText(
+                error instanceof Error ? error.message : String(error),
+                { secrets: redactionSecrets },
+              ),
+            },
+            null,
+            2,
+          )}\n`,
+          { mode: 0o600 },
+        );
+        throw error;
+      }
+      const txid = String(transactionId);
+      markTransactionInputsSpent(spentOutpoints, knownUtxos, parsed);
+      const pending = {
+        kind: "exact-transaction",
+        submitted: true,
+        accepted: false,
+        txid,
+        startCheckpoint,
+        ...paymentEvidence,
+      };
+      pendingBroadcasts.set(transaction, pending);
+      await waitForAddressOutpoint({
+        rpc,
+        address: pending.paymentAddress,
+        txid,
+        index: pending.paymentOutputIndex,
+        amount: BigInt(pending.paymentAmount),
+        scriptPublicKey: pending.paymentScriptPublicKey,
+      });
+      try {
+        pending.evidence = await waitForAcceptedTransactionEvidence({
+          rpc,
+          transactionId: txid,
+          fromCheckpoint: startCheckpoint,
+          minConfirmationCount: CONFIRMATION_THRESHOLD,
+        });
+      } catch (error) {
+        fs.writeFileSync(
+          path.join(dataDir, "last-chain-evidence-error.json"),
+          `${JSON.stringify(
+            {
+              generatedAt: new Date().toISOString(),
+              transactionId: txid,
+              message: sanitizeProofOutputText(
+                error instanceof Error ? error.message : String(error),
+                { secrets: redactionSecrets },
+              ),
+            },
+            null,
+            2,
+          )}\n`,
+          { mode: 0o600 },
+        );
+        throw error;
+      }
+      pending.accepted = true;
+      return {
+        transactionId: txid,
+        evidence: structuredClone(pending.evidence),
+        finality: "accepted",
+      };
+    },
+  };
+}
+
+function makeExactSettlementReconciler({ rpc, paymentAddress }) {
+  return {
+    async reconcileExactSettlement(attempt) {
+      const entries = await getAddressUtxos(rpc, paymentAddress);
+      const payment = entries.find(
+        (utxo) =>
+          utxo.outpoint.txid.toLowerCase() ===
+            attempt.transactionId.toLowerCase() &&
+          utxo.outpoint.index === attempt.paymentOutputIndex &&
+          utxo.amount === attempt.amount &&
+          utxo.scriptPublicKey.toLowerCase() ===
+            attempt.payToScriptPublicKey.toLowerCase(),
+      );
+      if (!payment) {
+        return {
+          status: "unknown",
+          transactionId: attempt.transactionId,
+          reason:
+            "payment output is not yet visible in the selected-chain UTXO set",
+        };
+      }
+      return {
+        status: "accepted",
+        transactionId: attempt.transactionId,
+        finality: "accepted",
+        paymentOutput: {
+          amount: payment.amount,
+          scriptPublicKey: payment.scriptPublicKey,
+          address: paymentAddress,
+        },
+      };
+    },
+  };
+}
+
+function makeRefundReconciler({ rpc, refundAddress, batchArtifactsByTxid }) {
+  return {
+    async reconcileRefund(attempt) {
+      const artifact = batchArtifactsByTxid.get(
+        attempt.transactionId.toLowerCase(),
+      );
+      if (!artifact || artifact.kind !== "batch-refund") {
+        return {
+          status: "unknown",
+          transactionId: attempt.transactionId,
+          reason: "the exact persisted refund artifact is unavailable",
+        };
+      }
+      const entries = await getAddressUtxos(rpc, refundAddress);
+      const refundOutput = entries.find(
+        (utxo) =>
+          utxo.outpoint.txid.toLowerCase() ===
+            attempt.transactionId.toLowerCase() &&
+          utxo.outpoint.index === 0 &&
+          utxo.amount === artifact.fee.refundOutputAmount &&
+          utxo.scriptPublicKey.toLowerCase() ===
+            artifact.transaction.outputs[0].scriptPublicKey.toLowerCase(),
+      );
+      if (!refundOutput) {
+        return {
+          status: "unknown",
+          transactionId: attempt.transactionId,
+          reason:
+            "the exact refund output is not visible in the selected-chain UTXO set",
+        };
+      }
+      return {
+        status: "accepted",
+        transactionId: attempt.transactionId,
+        finality: refundOutput.finality,
+      };
+    },
+  };
+}
+
+function makeExactHeadReconciler({ rpc, sdk, externalHeadProofs }) {
+  return {
+    async reconcileExactHead(head, candidateTransactionIds = []) {
+      const current = (await getAddressUtxos(rpc, head.payTo)).find(
+        (utxo) =>
+          outpointKey(utxo.outpoint) === outpointKey(head.currentOutpoint) &&
+          utxo.amount === head.currentAmount &&
+          utxo.scriptPublicKey.toLowerCase() ===
+            head.scriptPublicKey.toLowerCase(),
+      );
+      if (current) {
+        return {
+          status: "current",
+          outpoint: current.outpoint,
+          amount: current.amount,
+          scriptPublicKey: current.scriptPublicKey,
+          finality: "accepted",
+        };
+      }
+      for (const candidate of candidateTransactionIds) {
+        const proof = externalHeadProofs.get(candidate.toLowerCase());
+        if (!proof) continue;
+        const transaction = sdk.Transaction.deserializeFromSafeJSON(
+          proof.transaction,
+        );
+        if (transaction.id.toLowerCase() !== candidate.toLowerCase()) continue;
+        const object = transaction.serializeToObject();
+        const spent = transactionInputOutpoint(object.inputs[0]);
+        const successor = object.outputs[0];
+        if (
+          !spent ||
+          outpointKey(spent) !== outpointKey(head.currentOutpoint) ||
+          !successor ||
+          String(successor.scriptPublicKey).toLowerCase() !==
+            head.scriptPublicKey.toLowerCase() ||
+          BigInt(successor.value) <
+            BigInt(head.currentAmount) + BigInt(head.additiveThresholdSompi)
+        ) {
+          continue;
+        }
+        const observed = (await getAddressUtxos(rpc, head.payTo)).find(
+          (utxo) =>
+            utxo.outpoint.txid.toLowerCase() === candidate.toLowerCase() &&
+            utxo.outpoint.index === 0 &&
+            utxo.amount === String(successor.value) &&
+            utxo.scriptPublicKey.toLowerCase() ===
+              head.scriptPublicKey.toLowerCase(),
+        );
+        if (!observed) continue;
+        return {
+          status: "advanced",
+          steps: [
+            {
+              transactionId: candidate,
+              spentOutpoint: head.currentOutpoint,
+              successor: {
+                outpoint: observed.outpoint,
+                amount: observed.amount,
+                scriptPublicKey: observed.scriptPublicKey,
+              },
+              finality: "accepted",
+            },
+          ],
+        };
+      }
+      return {
+        status: "unknown",
+        reason: "no trusted candidate proved the current head successor",
+      };
+    },
+  };
+}
+
+function exactTransactionPaymentEvidence({
+  transaction,
+  addressCodec,
+  network,
+}) {
+  const object = transaction.serializeToObject();
+  const paymentOutputIndex = 0;
+  const paymentOutput = object.outputs[paymentOutputIndex];
+  if (!paymentOutput)
+    throw new Error("exact transaction artifact is missing canonical output 0");
+  const paymentScriptPublicKey = String(
+    paymentOutput.scriptPublicKey ?? "",
+  ).toLowerCase();
+  const scriptPublicKey = scriptPublicKeyFromSerializedObject(
+    paymentScriptPublicKey,
+  );
+  const paymentAddress = addressCodec.encodeScriptAddress({
+    network,
+    scriptPublicKey,
+    serializedScriptPublicKey: paymentScriptPublicKey,
+  });
+  return {
+    paymentAddress,
+    paymentOutputIndex,
+    paymentAmount: String(paymentOutput.value),
+    paymentScriptPublicKey,
+  };
+}
+
+function scriptPublicKeyFromSerializedObject(serialized) {
+  const bytes = hexToBytes(serialized);
+  if (bytes.length < 3)
+    throw new Error("serialized ScriptPublicKey is too short");
+  return {
+    version: (bytes[0] << 8) | bytes[1],
+    script: bytesToHex(bytes.slice(2)),
+  };
+}
+
+function makeSigner({
+  schnorr,
+  fundingPrivateKeyHex,
+  fundingPublicKey,
+  dataDir,
+}) {
+  return {
+    async generateChannelKey() {
+      const privateKey = bytesToHex(schnorr.utils.randomSecretKey());
+      const publicKey = bytesToHex(
+        schnorr.getPublicKey(hexToBytes(privateKey, { expectedLength: 32 })),
+      );
+      const file = path.join(
+        dataDir,
+        `client-channel-key-${Date.now()}-${publicKey.slice(0, 12)}.json`,
+      );
+      fs.writeFileSync(
+        file,
+        `${JSON.stringify({ createdAt: new Date().toISOString(), publicKey, privateKey }, null, 2)}\n`,
+        { mode: 0o600, flag: "wx" },
+      );
+      return { privateKey, publicKey };
+    },
+    async randomSalt() {
+      return bytesToHex(crypto.randomBytes(32));
+    },
+    async randomNonce() {
+      return bytesToHex(crypto.randomBytes(32));
+    },
+    async signVoucher({ digest, channel }) {
+      if (!channel.clientPrivateKey)
+        throw new Error("channel private key is required for voucher signing");
+      return bytesToHex(
+        schnorr.sign(
+          hexToBytes(digest, { expectedLength: 32 }),
+          hexToBytes(channel.clientPrivateKey, { expectedLength: 32 }),
+        ),
+      );
+    },
+    async signBatchPresentation({ digest, channel }) {
+      if (!channel.clientPrivateKey) {
+        throw new Error(
+          "channel private key is required for presentation signing",
+        );
+      }
+      return bytesToHex(
+        schnorr.sign(
+          hexToBytes(digest, { expectedLength: 32 }),
+          hexToBytes(channel.clientPrivateKey, { expectedLength: 32 }),
+        ),
+      );
+    },
+    async signRefund({ digest, channel }) {
+      if (!channel.clientPrivateKey)
+        throw new Error("channel private key is required for refund signing");
+      return signTransactionSchnorr(schnorr, digest, channel.clientPrivateKey);
+    },
+  };
+}
+
+function makeAddressCodec(sdk, networkId) {
+  return {
+    scriptPublicKeyForAddress(address) {
+      return serializeSdkScriptPublicKey(sdk.payToAddressScript(address));
+    },
+    encodeScriptAddress(input) {
+      const spk = new sdk.ScriptPublicKey(
+        input.scriptPublicKey.version,
+        input.scriptPublicKey.script,
+      );
+      const address = sdk.addressFromScriptPublicKey(spk, networkId);
+      if (!address) throw new Error("could not encode script address");
+      return address.toString();
+    },
+  };
+}
+
+async function buildPreparedClaim(input) {
+  const {
+    channel,
+    claimAmount,
+    rpc,
+    sdk,
+    networkId,
+    serverPrivateKeyHex,
+    addressCodec,
+    pendingBroadcasts,
+    knownUtxos,
+    spentOutpoints,
+    batchArtifactsByTxid,
+    dataDir,
+  } = input;
+  const claim = BigInt(claimAmount);
+  const inputAmount = BigInt(channel.fundingAmount);
+  const fee = DEFAULT_FEE_SOMPI;
+  if (claim <= fee) throw new Error("claim amount does not cover fee");
+  const settledAfter = (
+    BigInt(channel.claimedCumulativeAmount) + claim
+  ).toString();
+  const activeParams = escrowParams(channel, addressCodec);
+  const successorParams = escrowParamsFromChannelConfig(
+    channel.channelConfig,
+    addressCodec,
+    settledAfter,
+  );
+  const successorScriptPublicKey = serializedScriptPublicKey(
+    escrowScriptPublicKey(successorParams),
+  );
+  const compute = batchComputeProfile("claim");
+  const base = {
+    network: channel.channelConfig.network,
+    activeOutpoint: channel.activeOutpoint,
+    activeAmount: channel.fundingAmount,
+    activeScriptPublicKey: channel.activeScriptPublicKey,
+    activeRedeemScript: buildEscrowRedeemScript(activeParams),
+    covenantId: channel.covenantId,
+    claimedCumulativeAmount: channel.claimedCumulativeAmount,
+    authorizedCumulativeAmount: channel.signedMaxClaimable,
+    claimAmount,
+    successorScriptPublicKey,
+    successorRedeemScript: buildEscrowRedeemScript(successorParams),
+    serverOutputScriptPublicKey: serializeSdkScriptPublicKey(
+      sdk.payToAddressScript(channel.channelConfig.payTo),
+    ),
+    expectedPayoutScriptPublicKeyHash: activeParams.payoutScriptPublicKeyHash,
+    fee: fee.toString(),
+    serverSignature: "00".repeat(65),
+    voucherSignature: channel.voucherSignature,
+    computeBudget: compute.computeBudget,
+    scriptUnitsEstimate: compute.scriptUnitsEstimate,
+  };
+  const unsigned = buildBatchClaimTxV1Artifact(base);
+  const artifact = buildBatchClaimTxV1Artifact({
+    ...base,
+    serverSignature: signTransactionSchnorr(
+      input.schnorr,
+      unsigned.sighashes[0].digest,
+      serverPrivateKeyHex,
+    ),
+    mass: unsigned.transaction.mass,
+  });
+  const continuationAddress = scriptAddressFromSerialized(
+    sdk,
+    successorScriptPublicKey,
+    networkId,
+  );
+  const preparedTransaction = artifact.serializedTransaction;
+  pendingBroadcasts.set(preparedTransaction, {
+    kind: "batch-artifact",
+    operation: "claim",
+    artifact,
+    submitted: false,
+    accepted: false,
+    spentOutpoint: structuredClone(channel.activeOutpoint),
+    successorAddress: continuationAddress,
+    successorOutpoint: structuredClone(artifact.continuation.outpoint),
+    successorAmount: artifact.continuation.amount,
+    successorScriptPublicKey: artifact.continuation.scriptPublicKey,
+    covenantId: channel.covenantId,
+    channelId: channel.channelId,
+  });
+  batchArtifactsByTxid.set(artifact.transactionId.toLowerCase(), artifact);
+  persistBatchArtifact(dataDir, artifact);
+  return {
+    transaction: preparedTransaction,
+    transactionId: artifact.transactionId,
+    txVersion: 1,
+    claimAmount,
+    continuationOutpoint: artifact.continuation.outpoint,
+    continuationScriptPublicKey: artifact.continuation.scriptPublicKey,
+    continuationFundingAmount: (inputAmount - claim).toString(),
+  };
+}
+
+async function attemptBatchReplay(input) {
+  const {
+    channel,
+    currentChannel,
+    oldVoucher,
+    claimAmount,
+    rpc,
+    sdk,
+    networkId,
+    serverPrivateKeyHex,
+  } = input;
+  const replayClaimAmount = BigInt(claimAmount);
+  if (replayClaimAmount <= DEFAULT_FEE_SOMPI) {
+    throw new Error("continuation amount is too small for replay proof");
+  }
+  const evidence = {
+    attemptedInputOutpoint: channel.activeOutpoint,
+    attemptedTxVersion: 1,
+    attemptedTxVersionSource: ADAPTER_SUBMITTED_TX_VERSION_SOURCE,
+    serverOutputAmountSompi:
+      replayClaimAmount > DEFAULT_FEE_SOMPI
+        ? String(replayClaimAmount - DEFAULT_FEE_SOMPI)
+        : "0",
+    continuationOutputAmountSompi: String(
+      BigInt(channel.fundingAmount) - replayClaimAmount,
+    ),
+  };
+  try {
+    await rawClaim({
+      channel,
+      voucher: oldVoucher,
+      claimAmount: replayClaimAmount,
+      rpc,
+      sdk,
+      serverPrivateKeyHex,
+    });
+    return {
+      ...evidence,
+      rejected: false,
+      reason: "replay transaction was accepted",
+    };
+  } catch (error) {
+    if (
+      error?.rpcSubmissionAttempted !== true ||
+      error?.definitiveNodeRejection !== true ||
+      typeof error?.rejectedTransactionId !== "string"
+    ) {
+      throw error;
+    }
+    const spentAddress = scriptAddressFromSerialized(
+      sdk,
+      channel.activeScriptPublicKey,
+      networkId,
+    );
+    const currentAddress = scriptAddressFromSerialized(
+      sdk,
+      currentChannel.activeScriptPublicKey,
+      networkId,
+    );
+    const [spentCandidates, currentCandidates] = await Promise.all([
+      getAddressUtxos(rpc, spentAddress),
+      getAddressUtxos(rpc, currentAddress),
+    ]);
+    const spentOutpointAbsent = !spentCandidates.some(
+      (utxo) =>
+        outpointKey(utxo.outpoint) === outpointKey(channel.activeOutpoint),
+    );
+    const currentOutpointPresent = currentCandidates.some(
+      (utxo) =>
+        outpointKey(utxo.outpoint) ===
+          outpointKey(currentChannel.activeOutpoint) &&
+        utxo.covenantId?.toLowerCase() ===
+          currentChannel.covenantId.toLowerCase(),
+    );
+    if (!spentOutpointAbsent || !currentOutpointPresent) {
+      throw new Error(
+        "stale-head replay lacks authoritative spent/current outpoint evidence",
+        { cause: error },
+      );
+    }
+    return {
+      ...evidence,
+      rejected: true,
+      attemptedTransactionId: error.rejectedTransactionId,
+      rpcSubmissionAttempted: true,
+      definitiveNodeRejection: true,
+      spentOutpointAbsent,
+      currentOutpointPresent,
+      reason: String(error?.message ?? error).slice(0, 180),
+    };
+  }
+}
+
+async function rawClaim({
+  channel,
+  voucher,
+  claimAmount,
+  rpc,
+  sdk,
+  serverPrivateKeyHex,
+}) {
+  const addressCodec = {
+    scriptPublicKeyForAddress(address) {
+      return serializeSdkScriptPublicKey(sdk.payToAddressScript(address));
+    },
+  };
+  const activeParams = escrowParams(channel, addressCodec);
+  const successorParams = escrowParamsFromChannelConfig(
+    channel.channelConfig,
+    addressCodec,
+    (BigInt(channel.claimedCumulativeAmount) + claimAmount).toString(),
+  );
+  const compute = batchComputeProfile("claim");
+  const base = {
+    network: channel.channelConfig.network,
+    activeOutpoint: channel.activeOutpoint,
+    activeAmount: channel.fundingAmount,
+    activeScriptPublicKey: channel.activeScriptPublicKey,
+    activeRedeemScript: buildEscrowRedeemScript(activeParams),
+    covenantId: channel.covenantId,
+    claimedCumulativeAmount: channel.claimedCumulativeAmount,
+    authorizedCumulativeAmount: voucher.authorizedCumulativeAmount,
+    claimAmount: claimAmount.toString(),
+    successorScriptPublicKey: serializedScriptPublicKey(
+      escrowScriptPublicKey(successorParams),
+    ),
+    successorRedeemScript: buildEscrowRedeemScript(successorParams),
+    serverOutputScriptPublicKey: serializeSdkScriptPublicKey(
+      sdk.payToAddressScript(channel.channelConfig.payTo),
+    ),
+    expectedPayoutScriptPublicKeyHash: activeParams.payoutScriptPublicKeyHash,
+    fee: DEFAULT_FEE_SOMPI.toString(),
+    serverSignature: "00".repeat(65),
+    voucherSignature: voucher.signature,
+    computeBudget: compute.computeBudget,
+    scriptUnitsEstimate: compute.scriptUnitsEstimate,
+  };
+  const unsigned = buildBatchClaimTxV1Artifact(base);
+  const { schnorr } = await import("@noble/curves/secp256k1.js");
+  const artifact = buildBatchClaimTxV1Artifact({
+    ...base,
+    serverSignature: signTransactionSchnorr(
+      schnorr,
+      unsigned.sighashes[0].digest,
+      serverPrivateKeyHex,
+    ),
+    mass: unsigned.transaction.mass,
+  });
+  return submitBatchArtifact(rpc, sdk, artifact);
+}
+
+async function buildPreparedRefund(input) {
+  const {
+    channel,
+    refundAmount,
+    signDigest,
+    refundAddress,
+    rpc,
+    sdk,
+    addressCodec,
+    pendingBroadcasts,
+    batchArtifactsByTxid,
+    dataDir,
+  } = input;
+  const inputAmount = BigInt(channel.fundingAmount);
+  if (BigInt(refundAmount) !== inputAmount) {
+    throw new Error(
+      "batch refund request does not match the current head value",
+    );
+  }
+  const params = escrowParams(channel, addressCodec);
+  const channelConfig = channel.channelConfig ?? channel.config;
+  if (!channelConfig) throw new Error("batch refund channel config is missing");
+  const refundScriptPublicKey = serializeSdkScriptPublicKey(
+    sdk.payToAddressScript(refundAddress),
+  );
+  const compute = batchComputeProfile("refund");
+  const base = {
+    activeOutpoint: channel.activeOutpoint,
+    activeAmount: channel.fundingAmount,
+    activeScriptPublicKey: channel.activeScriptPublicKey,
+    activeRedeemScript: buildEscrowRedeemScript(params),
+    covenantId: channel.covenantId,
+    refundOutputScriptPublicKey: refundScriptPublicKey,
+    expectedRefundScriptPublicKeyHash: params.refundScriptPublicKeyHash,
+    fee: DEFAULT_FEE_SOMPI.toString(),
+    clientSignature: "00".repeat(65),
+    timeoutDaa: channelConfig.refundTimeoutDaa,
+    lockTimeDaa: (BigInt(channelConfig.refundTimeoutDaa) + 1n).toString(),
+    inputSequence: "0",
+    computeBudget: compute.computeBudget,
+    scriptUnitsEstimate: compute.scriptUnitsEstimate,
+  };
+  const unsigned = buildBatchRefundTxV1Artifact(base);
+  const clientSignature = await signDigest(unsigned.sighashes[0].digest);
+  const artifact = buildBatchRefundTxV1Artifact({
+    ...base,
+    clientSignature,
+    mass: unsigned.transaction.mass,
+  });
+  const serverInfo = await rpc.getServerInfo();
+  const observedDaaScore = String(serverInfo.virtualDaaScore);
+  if (BigInt(observedDaaScore) <= BigInt(artifact.transaction.lockTime)) {
+    throw new Error(
+      "authoritative DAA score has not passed the batch refund lock time",
+    );
+  }
+  const preparedTransaction = artifact.serializedTransaction;
+  pendingBroadcasts.set(preparedTransaction, {
+    kind: "batch-artifact",
+    operation: "refund",
+    terminal: true,
+    artifact,
+    submitted: false,
+    accepted: false,
+    spentOutpoint: structuredClone(channel.activeOutpoint),
+    refundAddress,
+    refundOutputIndex: 0,
+    refundOutputAmount: artifact.fee.refundOutputAmount,
+    refundScriptPublicKey,
+    observedDaaScore,
+    channelId: channel.id,
+  });
+  batchArtifactsByTxid?.set(artifact.transactionId.toLowerCase(), artifact);
+  if (dataDir) persistBatchArtifact(dataDir, artifact);
+  return {
+    transaction: preparedTransaction,
+    transactionId: artifact.transactionId,
+    refundAmount: inputAmount.toString(),
+  };
+}
+
+async function sendFromFunding({
+  rpc,
+  sdk,
+  networkId,
+  fundingPrivateKey,
+  fundingAddress,
+  outputs,
+  entries,
+  spentOutpoints,
+}) {
+  const feeEstimate = await rpc.getFeeEstimate();
+  const feeRate =
+    feeEstimate.estimate?.normalBuckets?.[0]?.feerate ??
+    feeEstimate.estimate?.priorityBucket?.feerate ??
+    1;
+  const sourceEntries = spendableFundingEntries(
+    entries ?? (await rpc.getUtxosByAddresses([fundingAddress])).entries,
+    spentOutpoints,
+  );
+  const { transactions } = await sdk.createTransactions({
+    entries: sourceEntries,
+    outputs,
+    changeAddress: fundingAddress,
+    feeRate,
+    priorityFee: 0n,
+    networkId,
+  });
+  let txid = "";
+  let txVersion = undefined;
+  for (const pending of transactions) {
+    txVersion = generatedTransactionVersion(pending);
+    await pending.sign([fundingPrivateKey]);
+    txid = await pending.submit(rpc);
+    markTransactionInputsSpent(spentOutpoints, undefined, pending.transaction);
+  }
+  if (!txid) throw new Error("transaction generator produced no transaction");
+  return { txid, txVersion, txVersionSource: SDK_GENERATED_TX_VERSION_SOURCE };
+}
+
+function spendableFundingEntries(entries, spentOutpoints) {
+  const spendable = entries.filter(
+    (entry) => !spentOutpoints?.has(entryOutpointKey(entry)),
+  );
+  if (spendable.length === 0) {
+    throw new Error(
+      "no locally spendable funding UTXOs remain after excluding pending spends",
+    );
+  }
+  return spendable.sort((left, right) => {
+    const leftAmount = BigInt(left.entry?.amount ?? left.amount ?? 0);
+    const rightAmount = BigInt(right.entry?.amount ?? right.amount ?? 0);
+    return leftAmount > rightAmount ? -1 : leftAmount < rightAmount ? 1 : 0;
+  });
+}
+
+function generatedTransactionVersion(pending) {
+  const version = pending.transaction?.version;
+  if (!Number.isInteger(version)) {
+    throw new Error(
+      "generated funding transaction did not expose a numeric version",
+    );
+  }
+  return version;
+}
+
+function rememberFundingVersion(fundingVersionByTxid, sent) {
+  fundingVersionByTxid.set(sent.txid.toLowerCase(), {
+    txVersion: sent.txVersion,
+    txVersionSource: sent.txVersionSource,
+  });
+}
+
+function versionEvidenceForTxid(fundingVersionByTxid, txid) {
+  const evidence = fundingVersionByTxid.get(String(txid).toLowerCase());
+  if (!evidence) {
+    throw new Error(
+      `missing generated transaction version evidence for ${txid}`,
+    );
+  }
+  return evidence;
+}
+
+function authorizationVersionEvidence(fundingVersionByTxid, txid) {
+  const evidence = versionEvidenceForTxid(fundingVersionByTxid, txid);
+  return {
+    authorizationTxVersion: evidence.txVersion,
+    authorizationTxVersionSource: evidence.txVersionSource,
+  };
+}
+
+export async function liveChainCheckpoint(rpc, { signal } = {}) {
+  signal?.throwIfAborted();
+  const rawInfo = signal
+    ? await awaitWithSignal(rpc.getBlockDagInfo(), signal)
+    : await rpc.getBlockDagInfo();
+  const info = rawInfo.blockDagInfo ?? rawInfo;
+  const blockHash = String(info.sink).toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(blockHash)) {
+    throw new Error("node returned an invalid selected-chain sink");
+  }
+  signal?.throwIfAborted();
+  const blockRequest = rpc.getBlock({
+    hash: blockHash,
+    includeTransactions: false,
+  });
+  const rawBlock = signal
+    ? await awaitWithSignal(blockRequest, signal)
+    : await blockRequest;
+  const block = rawBlock.block ?? rawBlock;
+  const header = block.header;
+  if (!header || String(header.hash).toLowerCase() !== blockHash) {
+    throw new Error("selected-chain checkpoint block does not match the sink");
+  }
+  return {
+    blockHash,
+    blueScore: String(header.blueScore),
+    daaScore: String(header.daaScore),
+  };
+}
+
+// [gateway port] Selected-chain time box and deep-checkpoint indexed path.
+export const LIVE_RPC_TIMEOUT_MS = 30_000;
+export const LIVE_DEEP_SCAN_BLUE_SCORE = 2_000;
+// locate(txid) -> accepting block hash | null (an index such as the REST API, used only to *locate*; the
+// node then authenticates chain-block status, blue score and depth). candidates: txids this kit cares about.
+export const liveIndexedChain = { locate: null, candidates: new Set(), prove: null };
+// N-L8: per-kit indexed-chain state, attached to that kit's RPC client (module global is only the fallback).
+const IX = Symbol.for("x402-gateway:indexed-chain");
+const ixOf = (rpc) => rpc?.[IX] ?? liveIndexedChain;
+async function liveRpcWithTimeout(promise, signal, label, timeoutMs = LIVE_RPC_TIMEOUT_MS) {
+  const t = AbortSignal.timeout(timeoutMs);
+  const s = signal ? AbortSignal.any([signal, t]) : t;
+  try { return await awaitWithSignal(promise, s); }
+  catch (error) {
+    if (t.aborted && !signal?.aborted) {
+      const e = new Error(`node RPC ${label} timed out after ${timeoutMs / 1000}s (Kaspa TN10 node did not answer)`);
+      e.code = "LIVE_RPC_TIMEOUT"; throw e;
+    }
+    throw error;
+  }
+}
+async function liveIndexedSelectedChain(rpc, startBlueScore, stopBlueScore, minConfirmationCount, signal) {
+  const byBlock = new Map();
+  const ix = ixOf(rpc);
+  for (const txid of ix.candidates) {
+    signal?.throwIfAborted();
+    const hash = await ix.locate(txid, signal);
+    if (!hash) continue;
+    const b = await liveRpcWithTimeout(rpc.getBlock({ hash, includeTransactions: false }), signal, `getBlock(${hash})`);
+    const header = b?.block?.header; const blue = BigInt(header?.blueScore ?? -1);
+    // N-M4: a missing chain-block flag is a hard error (never "skip and hope"); false = not on the selected chain.
+    if (typeof b?.block?.verboseData?.isChainBlock !== "boolean") throw new Error(`node did not report chain-block status for ${hash}`);
+    if (b.block.verboseData.isChainBlock !== true) continue;
+    // P-H1: the index only LOCATES the block. Acceptance itself must be proven by the node: an output of the
+    // transaction is present in the node's UTXO set (only accepted transactions create UTXOs), at the required depth.
+    if (!ix.prove || !(await ix.prove(txid, blue, minConfirmationCount, signal))) continue;
+    if (blue <= startBlueScore || blue > stopBlueScore) continue;
+    if (stopBlueScore - blue < BigInt(minConfirmationCount)) continue;
+    const entry = byBlock.get(hash) ?? { blockHash: hash, header: { hash, blueScore: String(blue) }, transactions: [] };
+    entry.transactions.push({ transactionId: txid }); byBlock.set(hash, entry);
+  }
+  const addedChainBlocks = [...byBlock.values()].sort((a, b) =>
+    (BigInt(a.header.blueScore) < BigInt(b.header.blueScore) ? -1 : 1));
+  return { removedChainBlockHashes: [], addedChainBlocks };
+}
+
+async function liveSelectedChainFromCheckpoint(
+  rpc,
+  startHash,
+  minConfirmationCount,
+  stopHash,
+  stopBlueScore,
+  signal,
+) {
+  signal?.throwIfAborted();
+  const normalizedStartHash = startHash.toLowerCase();
+  const normalizedStopHash = stopHash.toLowerCase();
+  if (normalizedStartHash === normalizedStopHash) {
+    return { removedChainBlockHashes: [], addedChainBlocks: [] };
+  }
+  // [gateway port] Bounded selected-chain reads. The public TN10 node never answers
+  // getVirtualChainFromBlockV2 from a checkpoint ~17k blue score deep (observed: no response in 400 s,
+  // even at verbosity "None"; 300 blocks deep answers in 0.6 s). That unbounded await was the refund hang.
+  // Every RPC here is now time-boxed, and deep checkpoints use an indexed path (see liveIndexedSelectedChain).
+  const startBlock = await liveRpcWithTimeout(rpc.getBlock({ hash: normalizedStartHash, includeTransactions: false }),
+    signal, `getBlock(${normalizedStartHash})`);
+  const startBlueScore = BigInt(startBlock?.block?.header?.blueScore ?? 0);
+  const depth = BigInt(stopBlueScore) - startBlueScore;
+  if (depth > BigInt(LIVE_DEEP_SCAN_BLUE_SCORE) ) {
+    if (!ixOf(rpc).locate) {
+      throw new Error(`selected-chain checkpoint is ${depth} blue score deep (> ${LIVE_DEEP_SCAN_BLUE_SCORE}); ` +
+        "the node cannot serve that range and no indexed locator is configured");
+    }
+    const vd = startBlock.block.verboseData;
+    if (typeof vd?.isChainBlock !== "boolean") throw new Error("deep selected-chain checkpoint: node omitted isChainBlock");
+    if (vd.isChainBlock !== true) {
+      // [gateway port] The checkpoint fell off the selected chain (reorg). Same semantics as the node's
+      // getVirtualChainFromBlockV2: the off-chain selected-parent ancestry down to the fork point is "removed";
+      // continue the indexed scan from the first ancestor that is still a chain block. Bounded walk.
+      const removed = []; let cur = startBlock.block;
+      for (let i = 0; cur.verboseData?.isChainBlock !== true; i++) {
+        if (i >= 2000) throw new Error("deep checkpoint reorg walk exceeded 2000 blocks");
+        removed.push(String(cur.verboseData.hash ?? cur.header?.hash).toLowerCase());
+        const parent = cur.verboseData?.selectedParentHash; if (!parent) throw new Error("deep checkpoint reorg walk: no selected parent");
+        cur = (await liveRpcWithTimeout(rpc.getBlock({ hash: parent, includeTransactions: false }), signal, `getBlock(${parent})`)).block;
+        if (typeof cur?.verboseData?.isChainBlock !== "boolean") throw new Error("deep checkpoint reorg walk: node omitted isChainBlock");
+      }
+      const r = await liveIndexedSelectedChain(rpc, BigInt(cur.header.blueScore), BigInt(stopBlueScore), minConfirmationCount, signal);
+      return { removedChainBlockHashes: [...removed, ...(r.removedChainBlockHashes ?? [])], addedChainBlocks: r.addedChainBlocks };
+    }
+    return liveIndexedSelectedChain(rpc, startBlueScore, BigInt(stopBlueScore), minConfirmationCount, signal);
+  }
+  let cursor = normalizedStartHash;
+  const removedChainBlockHashes = [];
+  const addedChainBlocks = [];
+  const removedSeen = new Set();
+  const addedSeen = new Set();
+  for (let page = 0; page < MAX_SELECTED_CHAIN_PAGES; page += 1) {
+    signal?.throwIfAborted();
+    const pageRequest = rpc.getVirtualChainFromBlockV2({
+      startHash: cursor,
+      dataVerbosityLevel: "Full",
+      minConfirmationCount,
+    });
+    const raw = await liveRpcWithTimeout(pageRequest, signal,
+      `getVirtualChainFromBlockV2(${cursor}, ${depth} blue score to tip)`);
+    signal?.throwIfAborted();
+    const response = raw.virtualChainFromBlockV2Response ?? raw;
+    const removed = response.removedChainBlockHashes ?? [];
+    const added = response.addedChainBlockHashes ?? [];
+    const accepted = response.chainBlockAcceptedTransactions ?? [];
+    if (
+      !Array.isArray(removed) ||
+      !Array.isArray(added) ||
+      !Array.isArray(accepted) ||
+      accepted.length !== added.length ||
+      added.length > 4_096
+    ) {
+      throw new Error("selected-chain V2 response is incomplete or oversized");
+    }
+    if (page > 0 && removed.length > 0) {
+      throw new Error("selected chain changed during paginated traversal");
+    }
+    for (const value of removed) {
+      const blockHash = String(value).toLowerCase();
+      if (removedSeen.has(blockHash)) {
+        throw new Error("selected-chain V2 response repeats a removed block");
+      }
+      removedSeen.add(blockHash);
+      removedChainBlockHashes.push(blockHash);
+    }
+    for (let index = 0; index < added.length; index += 1) {
+      const blockHash = String(added[index]).toLowerCase();
+      const block = accepted[index];
+      const header = block?.chainBlockHeader;
+      if (!header || String(header.hash).toLowerCase() !== blockHash) {
+        throw new Error(
+          "selected-chain V2 accepted block does not match its hash",
+        );
+      }
+      if (!Array.isArray(block.acceptedTransactions)) {
+        throw new Error(
+          "selected-chain V2 accepted transactions are incomplete",
+        );
+      }
+      if (addedSeen.has(blockHash)) {
+        throw new Error("selected-chain V2 response repeats an added block");
+      }
+      if (BigInt(header.blueScore) > BigInt(stopBlueScore)) {
+        return { removedChainBlockHashes, addedChainBlocks };
+      }
+      addedSeen.add(blockHash);
+      addedChainBlocks.push({
+        blockHash,
+        header,
+        transactions: block.acceptedTransactions,
+      });
+      if (addedChainBlocks.length > MAX_SELECTED_CHAIN_BLOCKS) {
+        throw new Error("selected-chain V2 traversal exceeds its block bound");
+      }
+      if (blockHash === normalizedStopHash) {
+        return { removedChainBlockHashes, addedChainBlocks };
+      }
+    }
+    if (added.length === 0) {
+      return { removedChainBlockHashes, addedChainBlocks };
+    }
+    cursor = String(added.at(-1)).toLowerCase();
+  }
+  throw new Error("selected-chain V2 traversal exceeded its page bound");
+}
+
+function liveAcceptedTransactionId(transaction) {
+  const transactionId =
+    transaction?.verboseData?.transactionId ??
+    transaction?.transactionId ??
+    transaction?.id;
+  const normalized = String(transactionId ?? "").toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(normalized)) {
+    throw new Error("selected-chain V2 transaction id is invalid");
+  }
+  return normalized;
+}
+
+function liveAcceptanceEvidence({
+  transactionId,
+  block,
+  minConfirmationCount,
+  checkpoint,
+}) {
+  return {
+    status: "accepted",
+    transactionId: transactionId.toLowerCase(),
+    acceptingBlockHash: block.blockHash,
+    acceptingBlockBlueScore: String(block.header.blueScore),
+    confirmationCount: minConfirmationCount,
+    checkpoint: structuredClone(checkpoint),
+  };
+}
+
+export async function waitForAcceptedTransactionEvidence({
+  rpc,
+  transactionId,
+  fromCheckpoint,
+  minConfirmationCount,
+  signal,
+  timeoutMs = DEFAULT_CONFIRMATION_TIMEOUT_MS,
+}) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > DEFAULT_CONFIRMATION_TIMEOUT_MS) {
+    throw new Error("accepted-transaction timeout must be within the live proof bound");
+  }
+  const normalizedTransactionId = transactionId.toLowerCase();
+  ixOf(rpc).candidates.add(normalizedTransactionId);
+  const started = Date.now();
+  const deadlineSignal = AbortSignal.timeout(timeoutMs);
+  const activeSignal = signal
+    ? AbortSignal.any([signal, deadlineSignal])
+    : deadlineSignal;
+  try {
+    while (Date.now() - started < timeoutMs) {
+      activeSignal.throwIfAborted();
+      const checkpoint = await liveChainCheckpoint(rpc, { signal: activeSignal });
+      const selected = await liveSelectedChainFromCheckpoint(
+        rpc,
+        fromCheckpoint.blockHash,
+        minConfirmationCount,
+        checkpoint.blockHash,
+        checkpoint.blueScore,
+        activeSignal,
+      );
+      for (const block of selected.addedChainBlocks) {
+        if (
+          block.transactions.some(
+            (transaction) =>
+              liveAcceptedTransactionId(transaction) === normalizedTransactionId,
+          )
+        ) {
+          if (
+            BigInt(block.header.blueScore) > BigInt(checkpoint.blueScore) ||
+            block.blockHash === checkpoint.blockHash ||
+            !(await liveCheckpointRemainsSelected(rpc, checkpoint, activeSignal))
+          ) {
+            break;
+          }
+          return liveAcceptanceEvidence({
+            transactionId: normalizedTransactionId,
+            block,
+            minConfirmationCount,
+            checkpoint,
+          });
+        }
+      }
+      await awaitWithSignal(sleep(500), activeSignal);
+    }
+  } catch (error) {
+    if (!deadlineSignal.aborted || signal?.aborted) throw error;
+  }
+  throw new Error(
+    `timed out waiting for ${minConfirmationCount}-deep selected-chain evidence for ${normalizedTransactionId}`,
+  );
+}
+
+export async function selectedChainEvidenceRemainsCanonical({ rpc, evidence, signal }) {
+  if (!evidence?.checkpoint || !/^[0-9a-f]{64}$/.test(String(evidence.checkpoint.blockHash)) ||
+    !/^[0-9]+$/.test(String(evidence.checkpoint.blueScore))) {
+    throw new Error("selected-chain evidence checkpoint is invalid");
+  }
+  const timeoutSignal = AbortSignal.timeout(60_000);
+  const activeSignal = signal
+    ? AbortSignal.any([signal, timeoutSignal])
+    : timeoutSignal;
+  const checkpoint = evidence.acceptingBlockHash === undefined
+    ? evidence.checkpoint
+    : { blockHash: evidence.acceptingBlockHash, blueScore: evidence.acceptingBlockBlueScore };
+  if (!/^[0-9a-f]{64}$/.test(String(checkpoint.blockHash)) ||
+    !/^[0-9]+$/.test(String(checkpoint.blueScore))) {
+    throw new Error("selected-chain accepting block is invalid");
+  }
+  return liveCheckpointRemainsSelected(rpc, checkpoint, activeSignal);
+}
+
+async function liveCheckpointRemainsSelected(rpc, checkpoint, signal) {
+  signal?.throwIfAborted();
+  // The node computes the removed path from startHash to its selected chain
+  // at one RPC snapshot. An empty removed path proves startHash is on that
+  // chain, including when it is the tip or the added path is paginated.
+  // No second tip snapshot or intervening transaction bodies are needed.
+  const request = rpc.getVirtualChainFromBlock({
+    startHash: checkpoint.blockHash,
+    includeAcceptedTransactionIds: false,
+  });
+  const raw = signal ? await awaitWithSignal(request, signal) : await request;
+  signal?.throwIfAborted();
+  const response = raw.virtualChainFromBlockResponse ?? raw;
+  if (!Array.isArray(response.removedChainBlockHashes) ||
+    !Array.isArray(response.addedChainBlockHashes) ||
+    [...response.removedChainBlockHashes, ...response.addedChainBlockHashes]
+      .some((hash) => !/^[0-9a-f]{64}$/.test(String(hash)))) {
+    throw new Error("selected-chain continuity response is incomplete or invalid");
+  }
+  return response.removedChainBlockHashes.length === 0;
+}
+
+async function discoverLiveCovenantLineage({
+  rpc,
+  request,
+  batchArtifactsByTxid,
+}) {
+  ixOf(rpc).candidates.add(request.lineage.manifest.genesis.transactionId.toLowerCase());
+  for (const txid of batchArtifactsByTxid.keys()) ixOf(rpc).candidates.add(txid);
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const checkpoint = await liveChainCheckpoint(rpc);
+    const selected = await liveSelectedChainFromCheckpoint(
+      rpc,
+      request.lineage.checkpoint.blockHash,
+      request.minConfirmationCount,
+      checkpoint.blockHash,
+      checkpoint.blueScore,
+    );
+    const frontier = selected.addedChainBlocks.at(-1);
+    if (
+      (frontier && BigInt(frontier.header.blueScore) > BigInt(checkpoint.blueScore)) ||
+      !(await liveCheckpointRemainsSelected(rpc, checkpoint))
+    ) {
+      continue;
+    }
+    if (
+      selected.removedChainBlockHashes.length > 0 &&
+      selected.addedChainBlocks.length === 0
+    ) {
+      throw new Error("selected-chain rollback lacks a confirmed replacement");
+    }
+    return liveCovenantSelectedChainUpdate({
+      request,
+      selected,
+      checkpoint,
+      batchArtifactsByTxid,
+    });
+  }
+  throw new Error("could not bind lineage discovery to a selected checkpoint");
+}
+
+function liveCovenantSelectedChainUpdate({
+  request,
+  selected,
+  checkpoint,
+  batchArtifactsByTxid,
+}) {
+  let working = applyCovenantSelectedChainUpdate(request.lineage, {
+    fromCheckpoint: request.lineage.checkpoint,
+    checkpoint,
+    continuity: "complete",
+    removedChainBlockHashes: selected.removedChainBlockHashes,
+    addedChainBlocks: [],
+  });
+  const addedChainBlocks = [];
+  for (const block of selected.addedChainBlocks) {
+    const transitions = [];
+    let genesisAcceptance;
+    for (const transaction of block.transactions) {
+      const transactionId = liveAcceptedTransactionId(transaction);
+      const acceptance = liveAcceptanceEvidence({
+        transactionId,
+        block,
+        minConfirmationCount: request.minConfirmationCount,
+        checkpoint,
+      });
+      if (
+        transactionId ===
+        request.lineage.manifest.genesis.transactionId.toLowerCase()
+      ) {
+        genesisAcceptance = acceptance;
+        continue;
+      }
+      const artifact = batchArtifactsByTxid.get(transactionId);
+      const transition = artifact
+        ? liveCovenantTransitionFromArtifact(artifact, acceptance, request)
+        : undefined;
+      if (transition) transitions.push(transition);
+    }
+    if (!genesisAcceptance && transitions.length === 0) continue;
+    const added = {
+      blockHash: block.blockHash,
+      ...(genesisAcceptance ? { genesisAcceptance } : {}),
+      transitions,
+    };
+    working = applyCovenantSelectedChainUpdate(working, {
+      fromCheckpoint: working.checkpoint,
+      checkpoint,
+      continuity: "complete",
+      removedChainBlockHashes: [],
+      addedChainBlocks: [added],
+    });
+    addedChainBlocks.push(added);
+  }
+  return {
+    fromCheckpoint: request.lineage.checkpoint,
+    checkpoint,
+    continuity: "complete",
+    removedChainBlockHashes: selected.removedChainBlockHashes,
+    addedChainBlocks,
+  };
+}
+
+function liveCovenantTransitionFromArtifact(artifact, acceptance, request) {
+  if (artifact.kind === "batch-genesis") return undefined;
+  const covenantId =
+    artifact.kind === "batch-refund"
+      ? artifact.covenantId
+      : artifact.continuation?.covenantId;
+  if (covenantId?.toLowerCase() !== request.covenantId.toLowerCase()) {
+    return undefined;
+  }
+  const consumedOutpoint = structuredClone(
+    artifact.transaction.inputs[0].previousOutpoint,
+  );
+  if (artifact.kind === "batch-refund") {
+    const terminal = artifact.transaction.outputs[0];
+    return {
+      kind: "refund",
+      covenantId,
+      templateId: request.templateId,
+      consumedOutpoint,
+      transactionId: artifact.transactionId,
+      authorizedSuccessorCount: 0,
+      successor: null,
+      terminalOutput: {
+        index: 0,
+        scriptPublicKey: terminal.scriptPublicKey,
+        value: terminal.amount,
+      },
+      acceptance,
+    };
+  }
+  if (artifact.kind !== "batch-claim" && artifact.kind !== "batch-top-up") {
+    return undefined;
+  }
+  const continuation = artifact.continuation;
+  const output = artifact.transaction.outputs[continuation.outputIndex];
+  const authorizedSuccessorCount = artifact.transaction.outputs.filter(
+    (candidate) => candidate.covenant?.covenantId === covenantId,
+  ).length;
+  if (
+    authorizedSuccessorCount !== 1 ||
+    output?.covenant?.covenantId !== covenantId
+  ) {
+    throw new Error("persisted covenant transition is not singleton-bound");
+  }
+  return {
+    kind: artifact.kind === "batch-claim" ? "claim" : "top-up",
+    covenantId,
+    templateId: request.templateId,
+    consumedOutpoint,
+    transactionId: artifact.transactionId,
+    authorizedSuccessorCount,
+    successor: {
+      covenantId,
+      authorizingInput: Number(output.covenant.authorizingInput),
+      outpoint: structuredClone(continuation.outpoint),
+      scriptPublicKey: continuation.scriptPublicKey,
+      value: continuation.amount,
+      claimedCumulativeAmount: continuation.claimedCumulativeAmount,
+    },
+    terminalOutput: null,
+    acceptance,
+  };
+}
+
+async function waitForAddressOutpoint(input) {
+  const started = Date.now();
+  let last = "not checked";
+  while (Date.now() - started < DEFAULT_CONFIRMATION_TIMEOUT_MS) {
+    const entries = await getAddressUtxos(input.rpc, input.address);
+    const match = entries.find((utxo) => {
+      if (
+        input.txid &&
+        utxo.outpoint.txid.toLowerCase() !== input.txid.toLowerCase()
+      )
+        return false;
+      if (input.index !== undefined && utxo.outpoint.index !== input.index)
+        return false;
+      if (
+        !input.allowAnyAmount &&
+        input.amount !== undefined &&
+        BigInt(utxo.amount) !== input.amount
+      )
+        return false;
+      if (
+        input.scriptPublicKey &&
+        utxo.scriptPublicKey.toLowerCase() !==
+          input.scriptPublicKey.toLowerCase()
+      )
+        return false;
+      if (
+        input.covenantId &&
+        utxo.covenantId?.toLowerCase() !== input.covenantId.toLowerCase()
+      )
+        return false;
+      return true;
+    });
+    if (match) return match;
+    last = `${entries.length} candidate UTXO(s)`;
+    await sleep(1_000);
+  }
+  throw new Error(
+    `timed out waiting for ${input.address} outpoint ${input.txid ?? "*"}:${input.index ?? "*"} (${last})`,
+  );
+}
+
+export async function getAddressUtxos(rpc, address) {
+  const { entries } = await rpc.getUtxosByAddresses([address]);
+  return entries.map((entry) => {
+    const raw = entry.entry ?? entry;
+    const outpoint = raw.outpoint ?? entry.outpoint;
+    return {
+      outpoint: {
+        txid: String(outpoint.transactionId),
+        index: Number(outpoint.index),
+      },
+      amount: String(raw.amount ?? entry.amount),
+      scriptPublicKey: serializeSdkScriptPublicKey(
+        raw.scriptPublicKey ?? entry.scriptPublicKey,
+      ),
+      finality: "accepted",
+      address,
+      raw: entry,
+      ...optionalNonzeroCovenantId(
+        raw.covenantId ??
+          raw.covenant_id ??
+          entry.covenantId ??
+          entry.covenant_id,
+      ),
+    };
+  });
+}
+
+async function refreshKnownUtxo(rpc, knownUtxos, outpoint) {
+  const known = knownUtxos.get(outpointKey(outpoint));
+  if (!known?.address) return null;
+  const current = (await getAddressUtxos(rpc, known.address)).find(
+    (candidate) => outpointKey(candidate.outpoint) === outpointKey(outpoint),
+  );
+  if (!current) {
+    knownUtxos.delete(outpointKey(outpoint));
+    return null;
+  }
+  if (
+    current.amount !== known.amount ||
+    current.scriptPublicKey.toLowerCase() !==
+      known.scriptPublicKey.toLowerCase() ||
+    current.covenantId?.toLowerCase() !== known.covenantId?.toLowerCase()
+  ) {
+    throw new Error(
+      "authoritative current-head readback conflicts with persisted state",
+    );
+  }
+  if (known.acceptance) {
+    current.acceptance = structuredClone(known.acceptance);
+  }
+  rememberUtxo(knownUtxos, current);
+  return current;
+}
+
+async function balanceSompi(rpc, address) {
+  const { entries } = await rpc.getBalancesByAddresses([address]);
+  return entries.reduce((sum, entry) => sum + BigInt(entry.balance ?? 0), 0n);
+}
+
+async function waitForDaa(rpc, target, reconcile) {
+  let lastReconciliation = Date.now();
+  while (true) {
+    const info = await rpc.getServerInfo();
+    if (BigInt(info.virtualDaaScore) >= target) return;
+    // Keep both lineage checkpoints recent during the refund timelock. A
+    // single Full V2 read after a long idle wait can exhaust the SDK heap.
+    if (reconcile && Date.now() - lastReconciliation >= 30_000) {
+      await reconcile();
+      lastReconciliation = Date.now();
+    }
+    await sleep(1_000);
+  }
+}
+
+function p2shInputBase(
+  outpoint,
+  amount,
+  scriptPublicKey,
+  sequence,
+  sigOpCount,
+) {
+  return {
+    previousOutpoint: { transactionId: outpoint.txid, index: outpoint.index },
+    sequence,
+    sigOpCount,
+    utxo: {
+      outpoint: { transactionId: outpoint.txid, index: outpoint.index },
+      amount,
+      scriptPublicKey,
+      blockDaaScore: 0n,
+      isCoinbase: false,
+    },
+  };
+}
+
+function p2pkInputBase(outpoint, amount, scriptPublicKey, sequence) {
+  return {
+    previousOutpoint: { transactionId: outpoint.txid, index: outpoint.index },
+    sequence,
+    sigOpCount: 0,
+    computeBudget: P2PK_COMPUTE_BUDGET,
+    utxo: {
+      outpoint: { transactionId: outpoint.txid, index: outpoint.index },
+      amount,
+      scriptPublicKey,
+      blockDaaScore: 0n,
+      isCoinbase: false,
+    },
+  };
+}
+
+function p2pkLegacyInputBase(outpoint, amount, scriptPublicKey, sequence) {
+  return {
+    previousOutpoint: { transactionId: outpoint.txid, index: outpoint.index },
+    sequence,
+    sigOpCount: 1,
+    utxo: {
+      outpoint: { transactionId: outpoint.txid, index: outpoint.index },
+      amount,
+      scriptPublicKey,
+      blockDaaScore: 0n,
+      isCoinbase: false,
+    },
+  };
+}
+
+function p2shComputeBudgetInputBase(
+  outpoint,
+  amount,
+  scriptPublicKey,
+  sequence,
+  computeBudget,
+) {
+  return {
+    previousOutpoint: { transactionId: outpoint.txid, index: outpoint.index },
+    sequence,
+    sigOpCount: 0,
+    computeBudget,
+    utxo: {
+      outpoint: { transactionId: outpoint.txid, index: outpoint.index },
+      amount,
+      scriptPublicKey,
+      blockDaaScore: 0n,
+      isCoinbase: false,
+    },
+  };
+}
+
+async function selectFundingUtxo(
+  rpc,
+  fundingAddress,
+  minimumAmount,
+  spentOutpoints,
+) {
+  const candidates = await getAddressUtxos(rpc, fundingAddress);
+  const sorted = candidates
+    .filter(
+      (utxo) =>
+        BigInt(utxo.amount) >= minimumAmount &&
+        !spentOutpoints?.has(outpointKey(utxo.outpoint)),
+    )
+    .sort((left, right) =>
+      BigInt(left.amount) < BigInt(right.amount)
+        ? -1
+        : BigInt(left.amount) > BigInt(right.amount)
+          ? 1
+          : 0,
+    );
+  const selected = sorted[0];
+  if (!selected) {
+    const available =
+      candidates.map((utxo) => utxo.amount).join(", ") || "none";
+    throw new Error(
+      `no funding UTXO covers ${minimumAmount} sompi for exact KIP-10 transaction; available: ${available}`,
+    );
+  }
+  return selected;
+}
+
+function scriptPublicKeyFromSerialized(sdk, serialized) {
+  const bytes = hexToBytes(serialized);
+  if (bytes.length < 3)
+    throw new Error("serialized script public key is too short");
+  const version = (bytes[0] << 8) | bytes[1];
+  const script = bytesToHex(bytes.slice(2));
+  return new sdk.ScriptPublicKey(version, script);
+}
+
+function escrowParams(channel, addressCodec) {
+  const channelConfig = channel.channelConfig ?? channel.config;
+  if (!channelConfig) throw new Error("batch channel config is missing");
+  return escrowParamsFromChannelConfig(
+    channelConfig,
+    addressCodec,
+    channel.claimedCumulativeAmount,
+  );
+}
+
+function escrowParamsFromChannelConfig(
+  channelConfig,
+  addressCodec,
+  claimedCumulativeAmount,
+) {
+  const payoutScriptPublicKey = addressCodec.scriptPublicKeyForAddress(
+    channelConfig.payTo,
+    channelConfig.network,
+  );
+  const refundScriptPublicKey = addressCodec.scriptPublicKeyForAddress(
+    channelConfig.refundAddress,
+    channelConfig.network,
+  );
+  return {
+    clientPublicKey: channelConfig.clientPublicKey,
+    serverPublicKey: channelConfig.serverPublicKey,
+    network: channelConfig.network,
+    payoutScriptPublicKeyHash: sha256Hex(hexToBytes(payoutScriptPublicKey)),
+    refundScriptPublicKeyHash: sha256Hex(hexToBytes(refundScriptPublicKey)),
+    timeoutDaa: channelConfig.refundTimeoutDaa,
+    claimedCumulativeAmount,
+  };
+}
+
+function paymentRequiredFor(server, input) {
+  return encodePaymentRequiredHeader(server.buildPaymentRequired(input));
+}
+
+function decodePaymentRequired(header) {
+  const required = decodePaymentRequiredHeader(header);
+  const accepted = required.accepts?.[0];
+  if (!accepted || accepted.scheme !== "exact") {
+    throw new Error("payment challenge is missing exact requirements");
+  }
+  return accepted;
+}
+
+function requestWithPayment(paymentPayload, input) {
+  let paymentHeader;
+  try {
+    paymentHeader = encodePaymentSignatureHeader(paymentPayload);
+  } catch (error) {
+    throw new Error(
+      `could not encode payment payload for ${input.url}: ${error?.message ?? String(error)} ${JSON.stringify(error?.details ?? error?.cause ?? null)}`,
+    );
+  }
+  return requestWithPaymentHeader(paymentHeader, input);
+}
+
+function requestWithPaymentHeader(paymentHeader, input) {
+  return trustedLoopbackProofRequest({
+    routeAccess: input.routeAccess,
+    method: "GET",
+    url: input.url,
+    body: null,
+    headers: {
+      [PAYMENT_SIGNATURE_HEADER]: paymentHeader,
+    },
+    resource: input.resource,
+    paymentAmount: input.amount,
+    paymentScheme: input.scheme,
+    requestHash: input.requestHash,
+  });
+}
+
+/** The loopback proof host supplies this key; payment payloads cannot choose it. */
+export function trustedLoopbackProofRequest(request) {
+  return { ...request, admissionKey: LIVE_LOOPBACK_ADMISSION_KEY };
+}
+
+function unsafePaymentHeader(value) {
+  return Buffer.from(stableStringify(value), "utf8").toString("base64");
+}
+
+function decodeResponse(response) {
+  const header = response.headers?.["PAYMENT-RESPONSE"];
+  if (!header) throw new Error("missing PAYMENT-RESPONSE header");
+  return decodePaymentResponseHeader(header);
+}
+
+function requireSettlementExtension(settlement) {
+  const extra = readKaspaSettlementExtension(settlement);
+  if (!extra)
+    throw new Error("settlement response is missing kaspa extension metadata");
+  return extra;
+}
+
+async function submitBatchArtifact(rpc, sdk, artifact) {
+  const transaction = referenceTransactionToSdk(sdk, artifact.transaction);
+  let transactionId;
+  try {
+    ({ transactionId } = await rpc.submitTransaction({
+      transaction,
+      allowOrphan: false,
+    }));
+  } catch (error) {
+    const message =
+      typeof error === "string"
+        ? error
+        : typeof error?.message === "string"
+          ? error.message
+          : String(error);
+    if (!isDefinitiveTransactionRejection(message, artifact.transactionId)) {
+      throw new Error(
+        `KIP-20 transaction ${artifact.kind} submission was indeterminate: ${message}`,
+        { cause: error },
+      );
+    }
+    const rejection = new Error(
+      `KIP-20 transaction ${artifact.kind} was rejected: ${message}`,
+    );
+    rejection.rpcSubmissionAttempted = true;
+    rejection.definitiveNodeRejection = true;
+    rejection.rejectedTransactionId = artifact.transactionId;
+    throw rejection;
+  }
+  return String(transactionId);
+}
+
+function isDefinitiveTransactionRejection(message, transactionId) {
+  const escapedTransactionId = transactionId.replace(
+    /[.*+?^${}()|[\]\\]/g,
+    "\\$&",
+  );
+  return new RegExp(
+    `(?:^|\\W)Rejected transaction\\s+${escapedTransactionId}:`,
+    "i",
+  ).test(message);
+}
+
+export function referenceTransactionToSdk(sdk, reference) {
+  const shape = {
+    version: reference.version,
+    inputs: reference.inputs.map((input) => ({
+      previousOutpoint: {
+        transactionId: input.previousOutpoint.txid,
+        index: input.previousOutpoint.index,
+      },
+      signatureScript: input.signatureScript,
+      sequence: BigInt(input.sequence),
+      sigOpCount: 0,
+      computeBudget: input.computeBudget,
+      utxo: {
+        outpoint: {
+          transactionId: input.previousOutpoint.txid,
+          index: input.previousOutpoint.index,
+        },
+        amount: BigInt(input.utxo.amount),
+        scriptPublicKey: scriptPublicKeyFromSerialized(
+          sdk,
+          input.utxo.scriptPublicKey,
+        ),
+        blockDaaScore: BigInt(input.utxo.blockDaaScore),
+        isCoinbase: false,
+        ...(input.utxo.covenantId
+          ? { covenant_id: input.utxo.covenantId }
+          : {}),
+      },
+    })),
+    outputs: reference.outputs.map((output) => ({
+      value: BigInt(output.amount),
+      scriptPublicKey: scriptPublicKeyFromSerialized(
+        sdk,
+        output.scriptPublicKey,
+      ),
+      ...(output.covenant
+        ? {
+            covenant: {
+              authorizingInput: output.covenant.authorizingInput,
+              covenantId: output.covenant.covenantId,
+            },
+          }
+        : {}),
+    })),
+    lockTime: BigInt(reference.lockTime),
+    subnetworkId: reference.subnetworkId,
+    gas: BigInt(reference.gas),
+    payload: reference.payload,
+    // Toccata renamed the JavaScript transaction commitment to storageMass.
+    // `mass` remains only as a deprecated SDK alias and must not be the
+    // canonical v1 RC2 adapter shape.
+    storageMass: BigInt(reference.mass),
+  };
+  try {
+    return new sdk.Transaction(shape);
+  } catch (error) {
+    throw new Error(
+      `configured Kaspa SDK cannot construct v1 RC2 KIP-20 transaction-v1: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+function signRawSchnorr(schnorr, digest, privateKeyHex) {
+  if (!schnorr) throw new Error("Schnorr implementation is required");
+  if (!privateKeyHex)
+    throw new Error("private key is required for KIP-20 transaction signing");
+  return bytesToHex(
+    schnorr.sign(
+      hexToBytes(digest, { expectedLength: 32 }),
+      hexToBytes(privateKeyHex, { expectedLength: 32 }),
+    ),
+  );
+}
+
+function signTransactionSchnorr(schnorr, digest, privateKeyHex) {
+  return `${signRawSchnorr(schnorr, digest, privateKeyHex)}01`;
+}
+
+function scriptAddressFromSerialized(sdk, serialized, networkId) {
+  const address = sdk.addressFromScriptPublicKey(
+    scriptPublicKeyFromSerialized(sdk, serialized),
+    networkId,
+  );
+  if (!address)
+    throw new Error("could not derive the persisted KIP-20 head address");
+  return address.toString();
+}
+
+export function persistExactPaymentAttempt(dataDir, record) {
+  const directory = path.join(dataDir, "exact-payment-attempts");
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const name = `${record.attemptId}.json`;
+  const file = path.join(directory, name);
+  const temporary = path.join(
+    directory,
+    `.${name}.${process.pid}.${crypto.randomBytes(8).toString("hex")}.tmp`,
+  );
+  let handle;
+  try {
+    handle = fs.openSync(temporary, "wx", 0o600);
+    fs.writeFileSync(handle, `${JSON.stringify(record, null, 2)}\n`);
+    fs.fsyncSync(handle);
+    fs.closeSync(handle);
+    handle = undefined;
+    fs.linkSync(temporary, file);
+    fs.rmSync(temporary);
+    fsyncDirectory(directory);
+  } catch (error) {
+    if (handle !== undefined) fs.closeSync(handle);
+    fs.rmSync(temporary, { force: true });
+    throw error;
+  }
+}
+
+export function loadPersistedExactPaymentAttempts(dataDir, spentOutpoints) {
+  const attempts = new Map();
+  const directory = path.join(dataDir, "exact-payment-attempts");
+  if (!fs.existsSync(directory)) return attempts;
+  for (const name of fs.readdirSync(directory).sort()) {
+    if (!/^[0-9a-f]{64}\.json$/.test(name)) continue;
+    const record = JSON.parse(
+      fs.readFileSync(path.join(directory, name), "utf8"),
+    );
+    if (
+      record.format !== "kaspa-x402-exact-provider-attempt-v1" ||
+      `${record.attemptId}.json` !== name ||
+      !/^[0-9a-f]{64}$/.test(record.intentHash ?? "") ||
+      !/^[0-9a-f]{64}$/i.test(record.result?.transactionId ?? "") ||
+      !Array.isArray(record.result?.inputOutpoints) ||
+      !Array.isArray(record.reservedOutpoints) ||
+      !record.reservedOutpoints.every(validFundingOutpoint) ||
+      !record.result.inputOutpoints.every(validFundingOutpoint)
+    ) {
+      throw new Error(`invalid persisted exact payment attempt ${name}`);
+    }
+    for (const outpoint of record.reservedOutpoints)
+      markOutpointSpent(spentOutpoints, outpoint);
+    attempts.set(record.attemptId, record);
+  }
+  return attempts;
+}
+
+function validFundingOutpoint(outpoint) {
+  return (
+    /^[0-9a-f]{64}$/i.test(outpoint?.txid ?? "") &&
+    Number.isInteger(outpoint?.index) &&
+    outpoint.index >= 0
+  );
+}
+
+function removeExactPaymentAttempt(dataDir, attemptId) {
+  const directory = path.join(dataDir, "exact-payment-attempts");
+  fs.rmSync(path.join(directory, `${attemptId}.json`), { force: true });
+  fsyncDirectory(directory);
+}
+
+export async function withExactPaymentStoreLock(dataDir, operation) {
+  const directory = path.join(dataDir, "exact-payment-attempts");
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const lock = path.join(directory, ".provider.lock");
+  let handle;
+  try {
+    handle = fs.openSync(lock, "wx", 0o600);
+  } catch (error) {
+    if (error?.code === "EEXIST") {
+      throw new Error(
+        `exact payment store is locked at ${lock}; remove it only after confirming the previous provider stopped`,
+      );
+    }
+    throw error;
+  }
+  try {
+    return await operation();
+  } finally {
+    fs.closeSync(handle);
+    fs.rmSync(lock, { force: true });
+  }
+}
+
+function fsyncDirectory(directory) {
+  // Node cannot portably open and sync directories on Windows. File fsync
+  // remains mandatory; Windows does not get the directory durability guarantee.
+  if (process.platform === "win32") return;
+  const handle = fs.openSync(directory, "r");
+  try {
+    fs.fsyncSync(handle);
+  } finally {
+    fs.closeSync(handle);
+  }
+}
+
+function persistBatchArtifact(dataDir, artifact) {
+  const directory = path.join(dataDir, "batch-artifacts");
+  return writeJsonAtomically(
+    directory,
+    `${artifact.transactionId}.json`,
+    artifact,
+  );
+}
+
+function loadPersistedBatchArtifacts({
+  dataDir,
+  sdk,
+  networkId,
+  batchArtifactsByTxid,
+  batchGenesisByOutpoint,
+  batchTopUpsByOutpoint,
+}) {
+  const directory = path.join(dataDir, "batch-artifacts");
+  if (!fs.existsSync(directory)) return 0;
+  let loaded = 0;
+  for (const name of fs.readdirSync(directory).sort()) {
+    if (!name.endsWith(".json")) continue;
+    const artifact = JSON.parse(
+      fs.readFileSync(path.join(directory, name), "utf8"),
+    );
+    if (
+      artifact.format !== "kaspa-x402-tx-v1-reference-v3" ||
+      !/^[0-9a-f]{64}$/.test(artifact.transactionId ?? "")
+    ) {
+      throw new Error(`invalid v1 RC2 persisted batch artifact ${name}`);
+    }
+    batchArtifactsByTxid.set(artifact.transactionId, artifact);
+    if (artifact.kind === "batch-genesis") {
+      const authorizedOutputCount = artifact.transaction.outputs.filter(
+        (output) =>
+          output.covenant?.covenantId === artifact.covenantId &&
+          output.covenant.authorizingInput === 0,
+      ).length;
+      const totalOutputCount = artifact.transaction.outputs.length;
+      if (authorizedOutputCount !== 1 || totalOutputCount !== 1) {
+        throw new Error(`invalid v1 RC2 singleton genesis artifact ${name}`);
+      }
+      const evidence = {
+        covenantId: artifact.covenantId,
+        authorizingInput: structuredClone(
+          artifact.transaction.inputs[0].previousOutpoint,
+        ),
+        genesisOutpoint: structuredClone(artifact.escrow.outpoint),
+        genesisScriptPublicKey: artifact.escrow.scriptPublicKey,
+        genesisAmount: artifact.escrow.amount,
+        authorizedOutputCount,
+        totalOutputCount,
+      };
+      batchGenesisByOutpoint.set(outpointKey(artifact.escrow.outpoint), {
+        artifact,
+        evidence,
+        address: scriptAddressFromSerialized(
+          sdk,
+          artifact.escrow.scriptPublicKey,
+          networkId,
+        ),
+      });
+    } else if (artifact.kind === "batch-top-up") {
+      const evidence = {
+        covenantId: artifact.continuation.covenantId,
+        spentOutpoint: structuredClone(
+          artifact.transaction.inputs[0].previousOutpoint,
+        ),
+        successorOutpoint: structuredClone(artifact.continuation.outpoint),
+        successorScriptPublicKey: artifact.continuation.scriptPublicKey,
+        successorAmount: artifact.continuation.amount,
+        authorizedSuccessorCount: artifact.transaction.outputs.filter(
+          (output) =>
+            output.covenant?.covenantId === artifact.continuation.covenantId,
+        ).length,
+        authorizingInput: 0,
+      };
+      batchTopUpsByOutpoint.set(outpointKey(artifact.continuation.outpoint), {
+        artifact,
+        evidence,
+        address: scriptAddressFromSerialized(
+          sdk,
+          artifact.continuation.scriptPublicKey,
+          networkId,
+        ),
+      });
+    }
+    loaded += 1;
+  }
+  return loaded;
+}
+
+function persistBatchRecoveryRecord(dataDir, name, value) {
+  const directory = path.join(dataDir, "batch-recovery");
+  return writeJsonAtomically(directory, `${name}.json`, value);
+}
+
+function writeJsonAtomically(directory, name, value) {
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const file = path.join(directory, name);
+  const temporary = path.join(
+    directory,
+    `.${name}.${process.pid}.${crypto.randomBytes(8).toString("hex")}.tmp`,
+  );
+  try {
+    fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, {
+      mode: 0o600,
+      flag: "wx",
+    });
+    fs.renameSync(temporary, file);
+  } catch (error) {
+    fs.rmSync(temporary, { force: true });
+    throw error;
+  }
+  return file;
+}
+
+export function runExactPaymentAttemptPersistenceProof() {
+  const dataDir = fs.mkdtempSync(
+    path.join(os.tmpdir(), "kaspa-x402-exact-attempts-"),
+  );
+  try {
+    const attemptId = "a1".repeat(32);
+    const reservedOutpoint = { txid: "b2".repeat(32), index: 1 };
+    const record = {
+      format: "kaspa-x402-exact-provider-attempt-v1",
+      attemptId,
+      intentHash: "c3".repeat(32),
+      result: {
+        transaction: '{"signed":"exact"}',
+        transactionId: "d4".repeat(32),
+        inputOutpoints: [reservedOutpoint],
+      },
+      reservedOutpoints: [reservedOutpoint],
+    };
+    persistExactPaymentAttempt(dataDir, record);
+    let overwriteRejected = false;
+    try {
+      persistExactPaymentAttempt(dataDir, {
+        ...record,
+        intentHash: "e5".repeat(32),
+      });
+    } catch (error) {
+      overwriteRejected = error?.code === "EEXIST";
+    }
+    const directory = path.join(dataDir, "exact-payment-attempts");
+    const interruptedTemp = path.join(
+      directory,
+      `.interrupted-exact-attempt.${process.pid}.tmp`,
+    );
+    fs.writeFileSync(interruptedTemp, '{"format":', {
+      mode: 0o600,
+      flag: "wx",
+    });
+    const spentOutpoints = new Set();
+    const attempts = loadPersistedExactPaymentAttempts(dataDir, spentOutpoints);
+    const loaded = attempts.get(attemptId);
+    if (
+      !overwriteRejected ||
+      attempts.size !== 1 ||
+      loaded?.intentHash !== record.intentHash ||
+      !spentOutpoints.has(outpointKey(reservedOutpoint)) ||
+      !fs.existsSync(interruptedTemp)
+    ) {
+      throw new Error(
+        "durable exact payment attempt persistence did not preserve its create-only reservation",
+      );
+    }
+    return {
+      committedAttemptReloaded: true,
+      changedIntentOverwriteRejected: true,
+      reservedInputReloaded: true,
+      interruptedTempIgnored: true,
+      attemptCount: attempts.size,
+    };
+  } finally {
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+}
+
+export function runBatchArtifactPersistenceProof() {
+  const dataDir = fs.mkdtempSync(
+    path.join(os.tmpdir(), "kaspa-x402-batch-artifacts-"),
+  );
+  try {
+    const artifact = JSON.parse(
+      fs.readFileSync(
+        path.join(REPO_ROOT, "vectors/tx-v1/batch-claim.json"),
+        "utf8",
+      ),
+    ).expected;
+    const committedFile = persistBatchArtifact(dataDir, artifact);
+    const directory = path.dirname(committedFile);
+    const successfulWriteTemps = fs
+      .readdirSync(directory)
+      .filter((name) => name.endsWith(".tmp"));
+    const interruptedTemp = path.join(
+      directory,
+      `.interrupted-batch-artifact.${process.pid}.tmp`,
+    );
+    fs.writeFileSync(interruptedTemp, '{"format":', {
+      mode: 0o600,
+      flag: "wx",
+    });
+
+    const artifacts = new Map();
+    const loaded = loadPersistedBatchArtifacts({
+      dataDir,
+      sdk: undefined,
+      networkId: "testnet-10",
+      batchArtifactsByTxid: artifacts,
+      batchGenesisByOutpoint: new Map(),
+      batchTopUpsByOutpoint: new Map(),
+    });
+    if (
+      loaded !== 1 ||
+      !artifacts.has(artifact.transactionId) ||
+      successfulWriteTemps.length !== 0 ||
+      !fs.existsSync(interruptedTemp)
+    ) {
+      throw new Error(
+        "atomic batch artifact persistence did not survive an interrupted temp file",
+      );
+    }
+    return {
+      committedArtifactReloaded: true,
+      atomicRenameCompleted: true,
+      interruptedTempIgnored: true,
+      artifactCount: loaded,
+    };
+  } finally {
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+}
+
+async function verifyBatchRecoveryReload({
+  dataDir,
+  sdk,
+  networkId,
+  clientStore,
+  serverStore,
+  batchRecovery,
+  expectedChannelId,
+  expectedGenesisOutpoint,
+  expectedTopUpOutpoint,
+}) {
+  if (!batchRecovery.preBroadcastSnapshotFile) {
+    throw new Error("pre-broadcast claim snapshot was not persisted");
+  }
+  const preBroadcast = JSON.parse(
+    fs.readFileSync(batchRecovery.preBroadcastSnapshotFile, "utf8"),
+  );
+  if (preBroadcast.format !== "kaspa-x402-v1-rc1-claim-before-broadcast-v1") {
+    throw new Error("pre-broadcast claim snapshot format is invalid");
+  }
+  const preBroadcastClientStore = new MemoryChannelStore(
+    preBroadcast.clientChannels,
+  );
+  const preBroadcastServerStore = new MemoryServerChannelStore(
+    preBroadcast.serverChannels,
+  );
+  if (
+    !preBroadcast.channelOperation ||
+    preBroadcast.channelOperation.leaseId !==
+      preBroadcast.attempt.operationLeaseId
+  ) {
+    throw new Error("pre-broadcast claim operation lease is invalid");
+  }
+  await preBroadcastServerStore.claimChannelOperation({
+    ...preBroadcast.channelOperation,
+    status: "reserved",
+    updatedAt: preBroadcast.channelOperation.createdAt,
+  });
+  await preBroadcastServerStore.saveClaimAttempt(preBroadcast.attempt);
+  const [preBroadcastClientChannel] =
+    await preBroadcastClientStore.loadChannels({});
+  const preBroadcastServerChannel =
+    await preBroadcastServerStore.loadChannel(expectedChannelId);
+  const claimAttempt =
+    await preBroadcastServerStore.loadOpenClaimAttempt(expectedChannelId);
+  if (
+    !preBroadcastClientChannel ||
+    !preBroadcastServerChannel ||
+    !claimAttempt ||
+    claimAttempt.status !== "pending" ||
+    claimAttempt.channelId !== expectedChannelId ||
+    claimAttempt.transaction !== preBroadcast.artifact?.serializedTransaction ||
+    claimAttempt.covenantId !== preBroadcastServerChannel.covenantId ||
+    outpointKey(claimAttempt.activeOutpoint) !==
+      outpointKey(preBroadcastServerChannel.activeOutpoint) ||
+    claimAttempt.activeScriptPublicKey !==
+      preBroadcastServerChannel.activeScriptPublicKey ||
+    claimAttempt.operationLeaseId !== preBroadcast.channelOperation.leaseId ||
+    claimAttempt.fundingAmount !== preBroadcastServerChannel.fundingAmount ||
+    outpointKey(preBroadcastClientChannel.activeOutpoint) !==
+      outpointKey(preBroadcastServerChannel.activeOutpoint) ||
+    preBroadcastClientChannel.covenantId !==
+      preBroadcastServerChannel.covenantId
+  ) {
+    throw new Error("pre-broadcast claim state failed restart reload");
+  }
+
+  const snapshot = {
+    format: "kaspa-x402-v1-rc1-batch-recovery-v1",
+    capturedAt: new Date().toISOString(),
+    clientChannels: await clientStore.loadChannels({}),
+    serverChannels: await serverStore.listChannels(),
+  };
+  const file = persistBatchRecoveryRecord(
+    dataDir,
+    "accepted-top-up-snapshot",
+    snapshot,
+  );
+  const reloaded = JSON.parse(fs.readFileSync(file, "utf8"));
+  if (reloaded.format !== snapshot.format) {
+    throw new Error("batch recovery snapshot format changed during reload");
+  }
+  const reloadedClientStore = new MemoryChannelStore(reloaded.clientChannels);
+  const reloadedServerStore = new MemoryServerChannelStore(
+    reloaded.serverChannels,
+  );
+  const [clientChannel] = await reloadedClientStore.loadChannels({});
+  const serverChannel =
+    await reloadedServerStore.loadChannel(expectedChannelId);
+  const acceptedOpenAttempt =
+    await reloadedServerStore.loadOpenClaimAttempt(expectedChannelId);
+  if (
+    !clientChannel ||
+    !serverChannel ||
+    acceptedOpenAttempt !== undefined ||
+    clientChannel.id !== expectedChannelId ||
+    serverChannel.channelId !== expectedChannelId ||
+    outpointKey(clientChannel.activeOutpoint) !==
+      outpointKey(serverChannel.activeOutpoint) ||
+    clientChannel.covenantId !== serverChannel.covenantId ||
+    clientChannel.fundingAmount !== serverChannel.fundingAmount ||
+    clientChannel.chargedCumulativeAmount !==
+      serverChannel.chargedCumulativeAmount ||
+    clientChannel.claimedCumulativeAmount !==
+      serverChannel.claimedCumulativeAmount ||
+    clientChannel.signedMaxClaimable !== serverChannel.signedMaxClaimable
+  ) {
+    throw new Error(
+      "batch channel or claim-attempt state failed restart reload",
+    );
+  }
+  const artifacts = new Map();
+  const genesis = new Map();
+  const topUps = new Map();
+  const artifactDirectory = path.join(dataDir, "batch-artifacts");
+  fs.mkdirSync(artifactDirectory, { recursive: true, mode: 0o700 });
+  const interruptedArtifactTemp = path.join(
+    artifactDirectory,
+    `.interrupted-reload.${process.pid}.${crypto.randomBytes(8).toString("hex")}.tmp`,
+  );
+  fs.writeFileSync(interruptedArtifactTemp, '{"format":', {
+    mode: 0o600,
+    flag: "wx",
+  });
+  let artifactCount;
+  try {
+    artifactCount = loadPersistedBatchArtifacts({
+      dataDir,
+      sdk,
+      networkId,
+      batchArtifactsByTxid: artifacts,
+      batchGenesisByOutpoint: genesis,
+      batchTopUpsByOutpoint: topUps,
+    });
+  } finally {
+    fs.rmSync(interruptedArtifactTemp, { force: true });
+  }
+  if (
+    !genesis.has(outpointKey(expectedGenesisOutpoint)) ||
+    !topUps.has(outpointKey(expectedTopUpOutpoint))
+  ) {
+    throw new Error("batch genesis or top-up evidence failed artifact reload");
+  }
+  return {
+    snapshotFormat: reloaded.format,
+    preBroadcastSnapshotFormat: preBroadcast.format,
+    preBroadcastClaimAttemptStatus: claimAttempt.status,
+    preBroadcastArtifactMatched: true,
+    acceptedTopUpHasNoOpenClaimAttempt: true,
+    channelId: expectedChannelId,
+    covenantId: serverChannel.covenantId,
+    activeOutpoint: serverChannel.activeOutpoint,
+    clientChannelReloaded: true,
+    serverChannelReloaded: true,
+    genesisEvidenceReloaded: true,
+    topUpEvidenceReloaded: true,
+    interruptedArtifactTempIgnored: true,
+    artifactCount,
+  };
+}
+
+async function verifyBatchRefundRecoveryReload({
+  dataDir,
+  clientStore,
+  batchRecovery,
+  expectedChannelId,
+  expectedTransactionId,
+}) {
+  const file = batchRecovery.preBroadcastRefundSnapshotFile;
+  if (!file) {
+    throw new Error("pre-broadcast refund snapshot was not persisted");
+  }
+  const snapshot = JSON.parse(fs.readFileSync(file, "utf8"));
+  if (snapshot.format !== "kaspa-x402-v1-rc1-refund-before-broadcast-v1") {
+    throw new Error("pre-broadcast refund snapshot format is invalid");
+  }
+  const reloadedStore = new MemoryChannelStore(snapshot.clientChannels, [
+    snapshot.attempt,
+  ]);
+  const [reloadedChannel] = await reloadedStore.loadChannels({});
+  const reloadedAttempt =
+    await reloadedStore.loadRefundAttempt(expectedChannelId);
+  const [currentChannel] = await clientStore.loadChannels({});
+  const currentAttempt = await clientStore.loadRefundAttempt(expectedChannelId);
+  if (
+    !reloadedChannel ||
+    !reloadedAttempt ||
+    reloadedChannel.id !== expectedChannelId ||
+    reloadedAttempt.status !== "pending" ||
+    reloadedAttempt.transaction !== snapshot.artifact?.serializedTransaction ||
+    reloadedAttempt.transactionId.toLowerCase() !==
+      expectedTransactionId.toLowerCase() ||
+    outpointKey(reloadedAttempt.activeOutpoint) !==
+      outpointKey(reloadedChannel.activeOutpoint) ||
+    reloadedAttempt.activeScriptPublicKey !==
+      reloadedChannel.activeScriptPublicKey ||
+    reloadedAttempt.covenantId !== reloadedChannel.covenantId ||
+    reloadedAttempt.refundAmount !== reloadedChannel.fundingAmount ||
+    !currentChannel ||
+    currentChannel.id !== expectedChannelId ||
+    currentChannel.status !== "refunded" ||
+    !currentAttempt ||
+    currentAttempt.status !== "applied" ||
+    currentAttempt.transactionId.toLowerCase() !==
+      expectedTransactionId.toLowerCase()
+  ) {
+    throw new Error("batch refund state failed durable restart validation");
+  }
+  const persisted = persistBatchRecoveryRecord(
+    dataDir,
+    "accepted-refund-snapshot",
+    {
+      format: "kaspa-x402-v1-rc1-refund-applied-v1",
+      capturedAt: new Date().toISOString(),
+      clientChannels: await clientStore.loadChannels({}),
+      attempt: currentAttempt,
+    },
+  );
+  const appliedSnapshot = JSON.parse(fs.readFileSync(persisted, "utf8"));
+  const appliedStore = new MemoryChannelStore(appliedSnapshot.clientChannels, [
+    appliedSnapshot.attempt,
+  ]);
+  const appliedAttempt =
+    await appliedStore.loadRefundAttempt(expectedChannelId);
+  if (!appliedAttempt || appliedAttempt.status !== "applied") {
+    throw new Error("applied refund attempt failed restart reload");
+  }
+  return {
+    preBroadcastSnapshotFormat: snapshot.format,
+    appliedSnapshotFormat: appliedSnapshot.format,
+    preBroadcastAttemptStatus: reloadedAttempt.status,
+    appliedAttemptStatus: appliedAttempt.status,
+    exactSignedTransactionReloaded: true,
+    exactTransactionIdMatched: true,
+    capturedHeadReloaded: true,
+    noAutomaticRebroadcast: true,
+  };
+}
+
+function verifyPersistedBatchGenesis(records, utxo) {
+  const record = records.get(outpointKey(utxo.outpoint));
+  if (!record) return null;
+  const { artifact, evidence } = record;
+  const authorized = artifact.transaction.outputs
+    .map((output, index) => ({ index, output }))
+    .filter(
+      ({ output }) =>
+        output.covenant?.covenantId === artifact.covenantId &&
+        output.covenant.authorizingInput === 0,
+    );
+  const recomputed = transactionV1CovenantId(
+    artifact.transaction.inputs[0].previousOutpoint,
+    authorized.map(({ index, output }) => ({ index, output })),
+  );
+  if (
+    !utxo.acceptance ||
+    artifact.kind !== "batch-genesis" ||
+    artifact.transaction.version !== 1 ||
+    artifact.transaction.outputs.length !== 1 ||
+    artifact.transaction.inputs[0].utxo.covenantId !== null ||
+    authorized.length !== 1 ||
+    evidence.totalOutputCount !== 1 ||
+    recomputed !== artifact.covenantId ||
+    utxo.covenantId?.toLowerCase() !== artifact.covenantId.toLowerCase() ||
+    utxo.amount !== evidence.genesisAmount ||
+    utxo.scriptPublicKey.toLowerCase() !==
+      evidence.genesisScriptPublicKey.toLowerCase()
+  ) {
+    return null;
+  }
+  return {
+    ...structuredClone(evidence),
+    acceptance: structuredClone(utxo.acceptance),
+  };
+}
+
+function verifyPersistedBatchTopUp(records, request) {
+  const record = records.get(outpointKey(request.next.activeOutpoint));
+  if (!record) return null;
+  const { artifact, evidence } = record;
+  const successorBindings = artifact.transaction.outputs.filter(
+    (output) => output.covenant?.covenantId === request.previous.covenantId,
+  );
+  if (
+    !request.utxo?.acceptance ||
+    artifact.kind !== "batch-top-up" ||
+    artifact.transaction.inputs[0].utxo.covenantId !==
+      request.previous.covenantId ||
+    successorBindings.length !== 1 ||
+    evidence.covenantId !== request.previous.covenantId ||
+    outpointKey(evidence.spentOutpoint) !==
+      outpointKey(request.previous.activeOutpoint) ||
+    outpointKey(evidence.successorOutpoint) !==
+      outpointKey(request.next.activeOutpoint) ||
+    evidence.successorScriptPublicKey.toLowerCase() !==
+      request.next.activeScriptPublicKey.toLowerCase() ||
+    evidence.successorAmount !== request.next.fundingAmount
+  ) {
+    return null;
+  }
+  return {
+    ...structuredClone(evidence),
+    acceptance: structuredClone(request.utxo.acceptance),
+  };
+}
+
+function optionalNonzeroCovenantId(value) {
+  if (value === undefined || value === null) return {};
+  const covenantId = String(value).toLowerCase();
+  if (!/^(?!0{64}$)[0-9a-f]{64}$/.test(covenantId)) {
+    throw new Error("node returned an invalid covenant id");
+  }
+  return { covenantId };
+}
+
+export function loadFundingPrivateKey(specifier) {
+  if (!specifier) throw new Error("KASPA_X402_FUNDING_WALLET is required");
+  if (specifier.startsWith("wallet-key:")) {
+    return fs
+      .readFileSync(path.resolve(specifier.slice("wallet-key:".length)), "utf8")
+      .trim();
+  }
+  if (/^[0-9a-fA-F]{64}$/.test(specifier)) return specifier.toLowerCase();
+  throw new Error(
+    "KASPA_X402_FUNDING_WALLET must be wallet-key:<path> or a 32-byte private key hex",
+  );
+}
+
+function loadOrCreateChannelKey(file, schnorr) {
+  if (fs.existsSync(file)) {
+    const privateKey = fs.readFileSync(file, "utf8").trim();
+    return {
+      privateKey,
+      publicKey: bytesToHex(
+        schnorr.getPublicKey(hexToBytes(privateKey, { expectedLength: 32 })),
+      ),
+    };
+  }
+  const privateKey = bytesToHex(schnorr.utils.randomSecretKey());
+  fs.writeFileSync(file, `${privateKey}\n`, { mode: 0o600, flag: "wx" });
+  return {
+    privateKey,
+    publicKey: bytesToHex(
+      schnorr.getPublicKey(hexToBytes(privateKey, { expectedLength: 32 })),
+    ),
+  };
+}
+
+function loadOrCreateWalletKey(file, sdk) {
+  if (fs.existsSync(file))
+    return new sdk.PrivateKey(fs.readFileSync(file, "utf8").trim());
+  const keypair = sdk.Keypair.random();
+  fs.writeFileSync(file, `${keypair.privateKey}\n`, { mode: 0o600, flag: "wx" });
+  return new sdk.PrivateKey(keypair.privateKey);
+}
+
+function serializeSdkScriptPublicKey(scriptPublicKey) {
+  const script = hexToBytes(String(scriptPublicKey.script));
+  const version = Number(scriptPublicKey.version ?? 0);
+  return bytesToHex(
+    Uint8Array.from([(version >>> 8) & 0xff, version & 0xff, ...script]),
+  );
+}
+
+function rememberUtxo(knownUtxos, utxo) {
+  knownUtxos.set(outpointKey(utxo.outpoint), utxo);
+}
+
+function markTransactionInputsSpent(spentOutpoints, knownUtxos, transaction) {
+  if (!spentOutpoints || !transaction) return;
+  const object =
+    typeof transaction.serializeToObject === "function"
+      ? transaction.serializeToObject()
+      : transaction;
+  for (const input of object.inputs ?? []) {
+    const outpoint = transactionInputOutpoint(input);
+    if (!outpoint) continue;
+    markOutpointSpent(spentOutpoints, outpoint);
+    knownUtxos?.delete(outpointKey(outpoint));
+  }
+}
+
+function markOutpointSpent(spentOutpoints, outpoint) {
+  spentOutpoints?.add(outpointKey(outpoint));
+}
+
+function outpointKey(outpoint) {
+  return `${outpoint.txid.toLowerCase()}:${outpoint.index}`;
+}
+
+function entryOutpointKey(entry) {
+  const raw = entry.entry ?? entry;
+  const outpoint = raw.outpoint ?? entry.outpoint;
+  return outpointKey({
+    txid: String(outpoint.transactionId),
+    index: Number(outpoint.index),
+  });
+}
+
+function hash(value) {
+  return sha256Hex(stableStringify(value));
+}
+
+function kaspaNetworkId(network) {
+  if (network === "kaspa:testnet-10") return "testnet-10";
+  throw new Error("live adapter only supports kaspa:testnet-10");
+}
+
+function positiveBigInt(value, label) {
+  const parsed = BigInt(value);
+  if (parsed <= 0n) throw new Error(`${label} must be positive`);
+  return parsed;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function awaitWithSignal(promise, signal) {
+  signal.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const aborted = () => reject(signal.reason ?? new Error("operation aborted"));
+    signal.addEventListener("abort", aborted, { once: true });
+    Promise.resolve(promise).then(
+      (value) => {
+        signal.removeEventListener("abort", aborted);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", aborted);
+        reject(error);
+      },
+    );
+  });
+}
+
+
+// ---------------------------------------------------------------------------
+// x402-gateway port: adapter factory (extracted from runLiveProof setup above).
+export async function createLiveKit({ restUrl = "https://api-tn10.kaspa.org", sdk, schnorr, rpc, network = "kaspa:testnet-10",
+  fundingPrivateKeyHex, serverPayoutAddress, dataDir, confirmations = 100 }) {
+  if (network !== "kaspa:testnet-10") throw new Error("createLiveKit is Testnet-10 only");
+  if (!Number.isSafeInteger(confirmations) || confirmations < 30) throw new Error("live kit: confirmations must be an integer >= 30");
+  CONFIRMATION_THRESHOLD = confirmations;
+  const ix = { locate: null, candidates: new Set(), prove: null }; rpc[IX] = ix;
+  for (const operation of ["claim", "top-up", "refund"]) batchComputeProfile(operation);
+  const networkId = kaspaNetworkId(network);
+  fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  const serverInfo = await rpc.getServerInfo();
+  if (String(serverInfo.networkId) !== "testnet-10") throw new Error(`node reports ${serverInfo.networkId}; testnet-10 only`);
+  if (!serverInfo.isSynced || !serverInfo.hasUtxoIndex) throw new Error("node must be synced with utxoindex");
+  const fundingPrivateKey = new sdk.PrivateKey(fundingPrivateKeyHex);
+  const fundingAddress = fundingPrivateKey.toAddress(networkId).toString();
+  const fundingPublicKey = bytesToHex(schnorr.getPublicKey(hexToBytes(fundingPrivateKeyHex, { expectedLength: 32 })));
+  const serverChannelKey = loadOrCreateChannelKey(path.join(dataDir, "server-channel-key"), schnorr);
+  const pendingBroadcasts = new Map(), knownUtxos = new Map(), spentOutpoints = new Set(), fundingVersionByTxid = new Map(),
+    batchArtifactsByTxid = new Map(), batchGenesisByOutpoint = new Map(), batchTopUpsByOutpoint = new Map(), batchRecovery = {};
+  loadPersistedBatchArtifacts({ dataDir, sdk, networkId, batchArtifactsByTxid, batchGenesisByOutpoint, batchTopUpsByOutpoint });
+  const addressCodec = makeAddressCodec(sdk, networkId);
+  // [gateway port] Restart recovery: upstream's chain/funding adapters resolve an outpoint only through the
+  // in-memory knownUtxos map (outpoint -> address). After a restart that map is empty, so the post-claim
+  // continuation (or any covenant output) reads as "funding outpoint was not found". Re-seed it from the
+  // persisted batch artifacts with an authoritative address readback of each still-unspent output.
+  const seedErrors = [];
+  async function seedKnownUtxosFromArtifacts() {
+    const byAddress = new Map();
+    for (const [txid, art] of batchArtifactsByTxid) {
+      (art.transaction?.outputs ?? []).forEach((o, index) => {
+        const hex = typeof o.scriptPublicKey === "string" ? o.scriptPublicKey : null; if (!hex) return;
+        const spk = new sdk.ScriptPublicKey(parseInt(hex.slice(0, 4), 16), hex.slice(4));
+        const address = sdk.addressFromScriptPublicKey(spk, networkId)?.toString(); if (!address) return;
+        (byAddress.get(address) ?? byAddress.set(address, new Set()).get(address)).add(`${txid}:${index}`);
+      });
+    }
+    let seeded = 0;
+    for (const [address, keys] of byAddress) {
+      for (const utxo of await getAddressUtxos(rpc, address)) {
+        if (!keys.has(`${utxo.outpoint.txid}:${utxo.outpoint.index}`)) continue;
+        // Upstream requires trusted acceptance evidence on a funding UTXO. Rebuild it from the node's selected
+        // chain, starting at the selected parent of the accepting block (REST is used only to locate that block).
+        let acceptance;
+        try {
+          const r = await fetch(`${restUrl}/transactions/${utxo.outpoint.txid}`, { signal: AbortSignal.timeout(15_000) });
+          const tx = r.ok ? await r.json() : null;
+          if (tx?.is_accepted && tx.accepting_block_hash) {
+            const blk = await rpc.getBlock({ hash: tx.accepting_block_hash, includeTransactions: false });
+            const from = blk?.block?.verboseData?.selectedParentHash;
+            if (from) acceptance = await waitForAcceptedTransactionEvidence({ rpc, transactionId: utxo.outpoint.txid,
+              fromCheckpoint: { blockHash: from }, minConfirmationCount: CONFIRMATION_THRESHOLD, timeoutMs: 60_000 });
+          }
+        } catch (e) { seedErrors.push({ txid: utxo.outpoint.txid, error: e.message }); }
+        rememberUtxo(knownUtxos, acceptance ? { ...utxo, acceptance } : utxo); seeded++;
+      }
+    }
+    return seeded;
+  }
+  ix.prove = async (txid, blockBlue, minConf, signal) => {
+    const art = batchArtifactsByTxid.get(txid); if (!art) return false;
+    const virt = BigInt((await liveRpcWithTimeout(rpc.getBlockDagInfo(), signal, "getBlockDagInfo")).virtualDaaScore ?? 0);
+    for (const [index, o] of (art.transaction?.outputs ?? []).entries()) {
+      const hex = typeof o.scriptPublicKey === "string" ? o.scriptPublicKey : null; if (!hex) continue;
+      const address = sdk.addressFromScriptPublicKey(new sdk.ScriptPublicKey(parseInt(hex.slice(0, 4), 16), hex.slice(4)), networkId)?.toString(); if (!address) continue;
+      const { entries } = await liveRpcWithTimeout(rpc.getUtxosByAddresses([address]), signal, "getUtxosByAddresses");
+      for (const e of entries) { const raw = e.entry ?? e; const op = raw.outpoint ?? e.outpoint;
+        if (String(op.transactionId).toLowerCase() === txid && Number(op.index) === index && virt - BigInt(raw.blockDaaScore ?? virt) >= BigInt(minConf)) return true; }
+    }
+    return false; // outputs spent or too shallow: the shallow node path (getVirtualChainFromBlockV2) must be used
+  };
+  ix.locate = async (txid, signal) => {
+    const r = await fetch(`${restUrl}/transactions/${txid}`, { signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000) });
+    if (!r.ok) return null; const tx = await r.json();
+    return tx?.is_accepted && /^[0-9a-f]{64}$/.test(String(tx.accepting_block_hash)) ? tx.accepting_block_hash : null;
+  };
+  for (const txid of batchArtifactsByTxid.keys()) ix.candidates.add(txid);
+  const seededOnStart = await seedKnownUtxosFromArtifacts();
+  const chain = makeChainProvider({ rpc, sdk, addressCodec, networkId, network, pendingBroadcasts, knownUtxos, spentOutpoints,
+    dataDir, batchArtifactsByTxid, batchGenesisByOutpoint, batchRecovery, redactionSecrets: [fundingPrivateKeyHex] });
+  const fundingProvider = makeFundingProvider({ rpc, sdk, addressCodec, chain, networkId, network, fundingPrivateKey,
+    fundingPrivateKeyHex, providerPrivateKeyHex: serverChannelKey.privateKey, fundingAddress, fundingPublicKey, schnorr,
+    pendingBroadcasts, knownUtxos, spentOutpoints, fundingVersionByTxid, batchArtifactsByTxid, batchGenesisByOutpoint,
+    batchTopUpsByOutpoint, dataDir });
+  const signer = makeSigner({ schnorr, fundingPrivateKeyHex, fundingPublicKey, dataDir });
+  const verify = (sig, digest, pub) => schnorr.verify(hexToBytes(sig, { expectedLength: 64 }), hexToBytes(digest, { expectedLength: 32 }), hexToBytes(pub, { expectedLength: 32 }));
+  const serverBatch = ({ minDepositSompi, claimReserveSompi = DEFAULT_FEE_SOMPI.toString(), refundTimeoutDaa }) => ({
+    serverPublicKey: serverChannelKey.publicKey, minDepositSompi, claimReserveSompi, refundTimeoutDaa,
+    voucherVerifier: { verifyVoucher: ({ digest, voucher, clientPublicKey }) => verify(voucher.signature, digest, clientPublicKey) },
+    batchPresentationVerifier: { verifyPresentation: ({ digest, signature, clientPublicKey }) => verify(signature, digest, clientPublicKey) },
+    topUpVerifier: { verifyTopUp: (request) => verifyPersistedBatchTopUp(batchTopUpsByOutpoint, request) },
+    claimBuilder: { buildClaimTransaction: ({ channel, claimAmount }) => buildPreparedClaim({ channel, claimAmount, rpc, sdk, networkId,
+      serverPrivateKeyHex: serverChannelKey.privateKey, addressCodec, pendingBroadcasts, knownUtxos, spentOutpoints,
+      batchArtifactsByTxid, dataDir, schnorr }) },
+  });
+  const clientBatch = () => ({
+    signer, refundAddress: fundingAddress,
+    refundBuilder: { buildRefundTransaction: (request) => buildPreparedRefund({ ...request, refundAddress: fundingAddress, rpc, sdk,
+      addressCodec, pendingBroadcasts, batchArtifactsByTxid, dataDir }) },
+    refundReconciler: makeRefundReconciler({ rpc, refundAddress: fundingAddress, batchArtifactsByTxid }),
+    verifyVoucherSignature(voucher, channel) {
+      const digest = voucherDigest({ network: channel.config.network, covenantId: channel.covenantId, authorizedCumulativeAmount: voucher.authorizedCumulativeAmount });
+      return verify(voucher.signature, digest, channel.clientPublicKey);
+    },
+  });
+  const exactTransactionVerifier = { verifyExactPayment: (request) => verifyExactTransaction({ sdk, schnorr,
+    transactionArtifact: request.transaction, request, fundingAddress, fundingPublicKey }) };
+  const exactSettlementReconciler = makeExactSettlementReconciler({ rpc, paymentAddress: serverPayoutAddress });
+  return { confirmations, network, networkId, fundingAddress, fundingPublicKey, serverPublicKey: serverChannelKey.publicKey, serverPayoutAddress,
+    addressCodec, chain, fundingProvider, signer, serverBatch, clientBatch, exactTransactionVerifier, exactSettlementReconciler,
+    feeSompi: DEFAULT_FEE_SOMPI, minPayoutSompi: BATCH_MIN_PAYOUT_AMOUNT, batchArtifactsByTxid, batchRecovery, seededOnStart, seedErrors, seedKnownUtxosFromArtifacts,
+    virtualDaa: async () => BigInt((await rpc.getServerInfo()).virtualDaaScore) };
+}

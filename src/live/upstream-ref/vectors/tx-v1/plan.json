@@ -1,0 +1,74 @@
+{
+  "kind": "tx-v1-plan",
+  "description": "v1 RC2 KIP-20 batch lane chain validated by the pinned full Rusty Kaspa TransactionValidator.",
+  "mainnetReadiness": {},
+  "invariant": {
+    "covenantId": "f0154292aca316533e639eccdca10e2f44ab6e4eab3a48fa9420c1b616da456e",
+    "voucherDigest": "8afb2e28f83812e9cd204f8b3a45ca04ad6ee132956e2535f17cfcab7624ae99",
+    "authorizedCumulativeAmount": "30000000",
+    "sequence": [
+      {
+        "step": 0,
+        "path": "vectors/tx-v1/batch-genesis.json",
+        "kind": "tx-v1-batch-genesis",
+        "transactionId": "7f9ec5e0de3b7460bc98fd003c9b925f3bd8fa530b391501527baa85c6ba124a"
+      },
+      {
+        "step": 1,
+        "path": "vectors/tx-v1/batch-claim.json",
+        "kind": "tx-v1-batch-claim",
+        "transactionId": "885668df2d118d4cafcc58601b067231e7f48d930628012e96aff8e948afcd05"
+      },
+      {
+        "step": 2,
+        "path": "vectors/tx-v1/batch-claim-second.json",
+        "kind": "tx-v1-batch-claim",
+        "transactionId": "f739d5c5ba82532b471822b53dfe706b54397ad8be035bef1342e52ac3794cdd"
+      },
+      {
+        "step": 3,
+        "path": "vectors/tx-v1/batch-top-up.json",
+        "kind": "tx-v1-batch-top-up",
+        "transactionId": "51cec5b18364d5c1ccc757e7808b29fff7e723e622ab9e5b3bc0f3683670d558"
+      },
+      {
+        "step": 4,
+        "path": "vectors/tx-v1/batch-refund.json",
+        "kind": "tx-v1-batch-refund",
+        "transactionId": "0432cbcc47ba1a289f648e6c5fb664c9bd8850870fef41b6235b95b98ae8eefc"
+      }
+    ]
+  },
+  "coveredVectors": [
+    {
+      "name": "tx-v1-batch-genesis",
+      "path": "vectors/tx-v1/batch-genesis.json",
+      "validation": "full-consensus-and-script-execution-offline-reference",
+      "description": "KIP-20 singleton genesis with exactly one total output from an ordinary client P2PK input."
+    },
+    {
+      "name": "tx-v1-batch-claim",
+      "path": "vectors/tx-v1/batch-claim.json",
+      "validation": "full-consensus-and-script-execution-offline-reference",
+      "description": "First partial claim under one lifetime cumulative voucher and stable covenant id."
+    },
+    {
+      "name": "tx-v1-batch-claim",
+      "path": "vectors/tx-v1/batch-claim-second.json",
+      "validation": "full-consensus-and-script-execution-offline-reference",
+      "description": "Second partial claim reusing the same voucher and stable covenant id."
+    },
+    {
+      "name": "tx-v1-batch-top-up",
+      "path": "vectors/tx-v1/batch-top-up.json",
+      "validation": "full-consensus-and-script-execution-offline-reference",
+      "description": "Client-and-provider-authorized top-up preserving the stable covenant id and claimed state."
+    },
+    {
+      "name": "tx-v1-batch-refund",
+      "path": "vectors/tx-v1/batch-refund.json",
+      "validation": "full-consensus-and-script-execution-offline-reference",
+      "description": "Client refund terminating the lane at its strict DAA timeout."
+    }
+  ]
+}

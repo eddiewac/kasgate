@@ -1,0 +1,36 @@
+{
+  "name": "kasgate",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "KasGate: Kaspa x402 payment gateway for API sellers and AI agents (Testnet-10 only).",
+  "scripts": {
+    "upstream": "node src/demo-upstream.mjs",
+    "gateway": "node bin/x402-gateway.mjs serve",
+    "demo": "node src/demo-e2e.mjs",
+    "test": "node --test test/",
+    "wallet:init": "node src/live/wallet-init.mjs",
+    "wallet:status": "node src/live/wallet-status.mjs",
+    "demo:live": "node src/live/demo-live.mjs",
+    "test:live": "LIVE=1 node --test test/",
+    "demo:batch": "node src/demo-batch.mjs",
+    "serve": "node bin/x402-gateway.mjs serve",
+    "hash-password": "node bin/x402-gateway.mjs hash-password"
+  },
+  "dependencies": {
+    "@kaspa-x402/adapters": "file:../upstream-x402/protocol/packages/adapters",
+    "@kaspa-x402/client": "file:../upstream-x402/protocol/packages/client",
+    "@kaspa-x402/core": "file:../upstream-x402/protocol/packages/core",
+    "@kaspa-x402/covenant": "file:../upstream-x402/protocol/packages/covenant",
+    "@kaspa-x402/facilitator": "file:../upstream-x402/protocol/packages/facilitator",
+    "@kaspa-x402/server": "file:../upstream-x402/protocol/packages/server",
+    "@noble/curves": "^1.9.7",
+    "better-sqlite3": "^11.10.0",
+    "websocket": "^1.0.35",
+    "yaml": "^2.5.0"
+  },
+  "bin": {
+    "x402-gateway": "bin/x402-gateway.mjs"
+  }
+}

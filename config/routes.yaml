@@ -1,0 +1,25 @@
+# Seller gateway config. TESTNET-10 ONLY.
+network: kaspa:testnet-10
+# Public HTTPS origin agents use to reach this gateway. kaspa-x402 binds payments
+# to this URL (it refuses http/localhost/IP destinations), so the local demo
+# maps it to 127.0.0.1 via a dev-only loopback transport.
+publicOrigin: https://api.demo.test
+listen: { host: 127.0.0.1, port: 8402 }
+upstream: http://127.0.0.1:8500
+payTo: kaspatest:demo-merchant-payout   # mock address; replace with a real TN10 address
+dashboard: { path: /_x402/dashboard }   # token: set X402_DASHBOARD_TOKEN (Bearer) or use X402_DASHBOARD_PASSWORD_HASH login
+routes:   # scheme defaults to batch-settlement; exact is explicit
+  - match: "GET /weather/*"
+    scheme: exact
+    priceSompi: "10000000"     # 0.1 KAS
+    description: Weather lookup
+  - match: "POST /summarize"
+    scheme: exact
+    priceSompi: "25000000"     # 0.25 KAS
+    description: Text summarisation
+  - match: "GET /premium/*"
+    scheme: exact
+    priceSompi: "200000000"    # 2 KAS (above default agent per-request cap)
+    description: Premium dataset
+  - match: "GET /health"
+    free: true
