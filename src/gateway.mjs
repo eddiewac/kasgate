@@ -36,7 +36,7 @@ export function ipKey(ip) {
 export function sigPaymentId(h) { try { const p = JSON.parse(Buffer.from(String(h), "base64").toString("utf8"));
   const id = p?.extensions?.["payment-identifier"]?.info?.id; return typeof id === "string" && /^[A-Za-z0-9_-]{16,128}$/.test(id) ? id : null; } catch { return null; } }
 
-export function createGateway(cfg, { ledgerPath = null, db = null, passwordHash = process.env.X402_DASHBOARD_PASSWORD_HASH, secureCookie = !/^(1|true)$/i.test(process.env.X402_INSECURE_COOKIE ?? ""), chain = "mock", realDeps, mockWorld, liveKit, refundTimeoutDaa, nowDaa, runId = randomUUID().slice(0, 8), maxBodyBytes = cfg.maxBodyBytes ?? 1_048_576, adapterTimeoutMs, verifyFirst = true, exactRecovery = true, payerRateLimit = { perMinute: 30 }, upstreamTimeoutMs: upstreamTimeoutOpt, settleReplayDelaysMs = chain === "real" ? [2000, 3000, 4000, 5000, 6000, 8000, 10000] : [50, 100], depthPreflight } = {}) {
+export function createGateway(cfg, { ledgerPath = null, db = null, passwordHash = process.env.X402_DASHBOARD_PASSWORD_HASH, secureCookie = !/^(1|true)$/i.test(process.env.X402_INSECURE_COOKIE ?? ""), chain = "mock", realDeps, mockWorld, liveKit, refundTimeoutDaa, nowDaa, runId = randomUUID().slice(0, 8), maxBodyBytes = cfg.maxBodyBytes ?? 1_048_576, adapterTimeoutMs, verifyFirst = true, exactRecovery = true, payerRateLimit = { perMinute: 30 }, upstreamTimeoutMs: upstreamTimeoutOpt, settleReplayDelaysMs = chain === "real" ? [2000, 3000, 4000, 5000, 6000, 8000, 10000] : [50, 100], depthPreflight, onReplayError } = {}) {
   if (!["mock", "real"].includes(chain)) throw new Error(`unknown chain mode ${chain}`);
   const hasBatch = cfg.routes.some((r) => r.scheme === "batch-settlement");
   if (hasBatch && chain === "real" && !liveKit) throw new Error("batch-settlement live adapters require liveKit (src/live/batch-kit.mjs createLiveBatchKit)");
@@ -65,7 +65,11 @@ export function createGateway(cfg, { ledgerPath = null, db = null, passwordHash 
     deps[k] = new Proxy(o, { get(t, p) { const v = t[p]; if (typeof v !== "function") return v;
       return async (...a) => { try { return await v.apply(t, a); } catch (e) { console.error(`[x402-debug] ${k}.${String(p)}: ${e?.message}`); throw e; } }; } });
   }
-  const store = db ? createPersistentServerStore(db) : new MemoryServerChannelStore();
+  // R6 (info): a journal replay failure is booked in the ledger (dashboard) and forwarded to the onReplayError alert hook.
+  let ledgerRef = null; const replayAlerts = [];
+  const store = db ? createPersistentServerStore(db, undefined, { onReplayError: (ev) => { replayAlerts.push(ev);
+    if (ledgerRef) ledgerRef.record({ outcome: "store-replay-alert", route: "(startup)", path: "-", amountSompi: "0", error: `${ev.errors.length} journal replay error(s)${ev.acknowledged ? " (acknowledged)" : ""}: ${JSON.stringify(ev.errors[0])}` });
+    try { onReplayError?.(ev); } catch (e) { console.error(`[x402] onReplayError hook threw: ${e?.message}`); } } }) : new MemoryServerChannelStore();
   const exactFinality = cfg.exactFinality ?? "accepted";
   // P0-3: node-verified exact deps (fresh per request: upstream PnnChainEvidence holds per-request state).
   const exactDeps = !hasExact ? null : chain === "real"
@@ -96,11 +100,16 @@ export function createGateway(cfg, { ledgerPath = null, db = null, passwordHash 
       delete: (k) => db.prepare("DELETE FROM kv WHERE ns='exact-pending' AND k=?").run(k),
       list: () => db.prepare("SELECT k, v FROM kv WHERE ns='exact-pending'").all().map((r) => ({ txid: r.k, ...JSON.parse(r.v) })) }
     : { set: (k, v) => pendingMem.set(k, v), get: (k) => pendingMem.get(k), delete: (k) => pendingMem.delete(k), list: () => [...pendingMem].map(([txid, v]) => ({ txid, ...v })) };
-  // R5-L3: pending payments expire. After pendingTtlMs (default 10 min, well past the client's authorization expiry) a
+  // R5-L3: pending payments expire. After pendingTtlMs (default = the payer's authorization lifetime, R6-L1) a
   // held payment moves to the refund-due queue: retries get 410 payment_expired_refund_due (never served, never a 402
   // that invites a 2nd payment), the ledger books "pending-expired", and an operator refunds it and records the
   // refund txid with markRefunded() / `x402-gateway refunds`. Refunds are operator-approved, never automatic.
-  const pendingTtlMs = Number(cfg.exactPendingTtlMs ?? 600_000);
+  // R6-L1 (protocol): the TTL must not outlive the payer's request authorization (accepted.maxTimeoutSeconds, upstream
+  // default 60 s): a pending payment past that point can never be re-presented, so it must already be refund-due.
+  // Default = the authorization lifetime; a configured TTL above it is refused at startup.
+  const authLifetimeMs = Number(cfg.maxTimeoutSeconds ?? 60) * 1000;
+  const pendingTtlMs = Number(cfg.exactPendingTtlMs ?? authLifetimeMs);
+  if (hasExact && pendingTtlMs > authLifetimeMs) throw new Error(`exactPendingTtlMs (${pendingTtlMs}) must be <= the payer authorization lifetime (maxTimeoutSeconds ${authLifetimeMs / 1000} s = ${authLifetimeMs} ms)`);
   const refundMem = new Map();
   const refunds = db ? { set: (k, v) => db.prepare("INSERT OR REPLACE INTO kv (ns,k,v) VALUES ('exact-refund-due',?,?)").run(k, JSON.stringify(v)),
       get: (k) => { const r = db.prepare("SELECT v FROM kv WHERE ns='exact-refund-due' AND k=?").get(k); return r ? JSON.parse(r.v) : undefined; },
@@ -149,7 +158,7 @@ export function createGateway(cfg, { ledgerPath = null, db = null, passwordHash 
     return async (...a) => { const t0 = Date.now(); try { const r = await v.apply(t, a); console.error(`[x402-debug] ${new Date().toISOString()} ${name}.${String(p)} ok ${Date.now() - t0}ms`); return r; }
       catch (e) { console.error(`[x402-debug] ${new Date().toISOString()} ${name}.${String(p)} THREW after ${Date.now() - t0}ms: ${e?.code ?? ""} ${e?.message}`); throw e; } }; } });
   const buildExact = (onVerified) => { const d0 = exactDeps(); const d = { ...d0, chainProvider: dbg("chain", d0.chainProvider), exactSettlementReconciler: dbg("settleRec", d0.exactSettlementReconciler), exactHeadReconciler: dbg("headRec", d0.exactHeadReconciler) }; const inner = d.exactTransactionVerifier;
-    return new DirectModeServer({ network: cfg.network, payTo: cfg.payTo, amount: "10000000", confirmationThreshold: confirmations, store, lockManager,
+    return new DirectModeServer({ network: cfg.network, payTo: cfg.payTo, amount: "10000000", ...(cfg.maxTimeoutSeconds != null ? { maxTimeoutSeconds: Number(cfg.maxTimeoutSeconds) } : {}), confirmationThreshold: confirmations, store, lockManager,
       exactProfile: "standard-native", addressCodec: d.addressCodec, chainProvider: d.chainProvider,
       exactTransactionVerifier: { verifyExactPayment: async (req) => { let v;
         const tv = Date.now(); try { v = await inner.verifyExactPayment(req); if (process.env.X402_DEBUG) console.error(`[x402-debug] verify ok ${Date.now() - tv}ms`); } catch (e) { console.error(`[x402-verify] exact verification failed: ${e?.code ?? ""} ${e?.message}`); throw e; }
@@ -159,7 +168,7 @@ export function createGateway(cfg, { ledgerPath = null, db = null, passwordHash 
       ...(d.exactHeadReconciler ? { exactHeadReconciler: d.exactHeadReconciler } : {}),
       ...(d.acceptedFinality ? { acceptedFinality: d.acceptedFinality } : {}), publicBoundaryController }); };
   const build = (timeout) => new DirectModeServer({
-    network: cfg.network, payTo: cfg.payTo, amount: "10000000",
+    network: cfg.network, payTo: cfg.payTo, amount: "10000000", ...(cfg.maxTimeoutSeconds != null ? { maxTimeoutSeconds: Number(cfg.maxTimeoutSeconds) } : {}),
     confirmationThreshold: confirmations, store, lockManager, exactProfile: "standard-native",
     addressCodec: deps.addressCodec ?? new MockAddressCodec(), chainProvider: deps.chainProvider ?? new MockChainProvider(),
     ...(world ? { batch: { ...world.serverBatch({ ...cfg.batch, refundTimeoutDaa: timeout.toString() }), minimumRefundLeadDaa: margin.toString(),
@@ -184,6 +193,7 @@ export function createGateway(cfg, { ledgerPath = null, db = null, passwordHash 
   }
   const seenExact = db ? { has: (k) => !!db.prepare("SELECT 1 FROM kv WHERE ns='exact-seen' AND k=?").get(k), add: (k) => db.prepare("INSERT OR IGNORE INTO kv (ns,k,v) VALUES ('exact-seen',?,?)").run(k, JSON.stringify({ at: new Date().toISOString(), runId })) } : null;
   const ledger = new Ledger(ledgerPath, db, { runId });
+  ledgerRef = ledger; for (const ev of replayAlerts) ledger.record({ outcome: "store-replay-alert", route: "(startup)", path: "-", amountSompi: "0", error: `${ev.errors.length} journal replay error(s)${ev.acknowledged ? " (acknowledged)" : ""}: ${JSON.stringify(ev.errors[0])}` });
   const sessions = createSessionManager({ passwordHash, db, secureCookie });
   const claimFee = BigInt(liveKit?.feeSompi ?? cfg.batch?.claimReserveSompi ?? 0);
   const minNet = BigInt(cfg.settlement?.minClaimNetSompi ?? (chain === "real" ? 11_000_000 : 0));
@@ -445,7 +455,17 @@ export function createGateway(cfg, { ledgerPath = null, db = null, passwordHash 
       const openPrice = openCharge != null && openCharge > BigInt(route.priceSompi) ? openCharge.toString() : null;
       // R5-M1: the challenge uses the same rule as the paid request: unless this client already holds a channel that is
       // past the claim minimum (it will pay the route price on it), offer the open price.
-      if (route.scheme === "batch-settlement" && !req.headers["payment-signature"] && openPrice) { const ic = await ipChannels(batchIpk); if (ic.all === 0 || ic.sub > 0) payAmount = openPrice; }
+      // R6-L1 / R6-L2: when the client names its own channel (kasgate-channel-id header, an untrusted hint) and that
+      // channel is active and was opened from this client's IP key, the offer uses the SAME per-channel rule as the
+      // paid request. Otherwise fall back to the per-IP rule. The paid price is always decided from server state.
+      const hintedChannel = async () => { const h = String(req.headers["kasgate-channel-id"] ?? "").trim().toLowerCase();
+        if (!db || !/^[0-9a-f]{64}$/.test(h)) return null;
+        const row = db.prepare("SELECT v FROM kv WHERE ns='batch-open-ip' AND k=?").get(h); if (!row) return null;
+        const v = JSON.parse(row.v); if ((v.ipKey ?? ipKey(v.ip)) !== batchIpk) return null;
+        const c = await store.loadChannel(h); return c && c.status === "active" ? c : null; };
+      if (route.scheme === "batch-settlement" && !req.headers["payment-signature"] && openPrice) { const hc = await hintedChannel();
+        if (hc) payAmount = channelBelowMin(hc) ? openPrice : route.priceSompi;
+        else { const ic = await ipChannels(batchIpk); if (ic.all === 0 || ic.sub > 0) payAmount = openPrice; } }
       if (route.scheme === "batch-settlement" && req.headers["payment-signature"]) {
         // R2-P0-1: "new channel" is decided from SERVER state (channel id unknown to the store), not from whether the
         // client chose to include fundingTransaction. Unparseable / id-less payloads count as new (fail closed).
@@ -583,7 +603,7 @@ export function createGateway(cfg, { ledgerPath = null, db = null, passwordHash 
       return send(resp.status, resp.status === 402 ? resp.headers : { ...upHeaders, ...resp.headers }, resp.body);
     } catch (err) { const id = randomUUID().slice(0, 8); console.error(`[x402-error ${id}] ${err?.stack ?? err}`); return send(502, {}, { error: "gateway error", id }); } // L6
   };
-  return { handler, ledger, confirmations, pendingExact: () => pending.list(), expirePending, refundsDue: () => refunds.list(), markRefunded, get server() { return server; }, store, chain, world, claimAll, claimNearTimeout, autoClaims, recovery, recovered, runId,
+  return { handler, ledger, confirmations, replayAlerts: () => replayAlerts.slice(), pendingExact: () => pending.list(), expirePending, refundsDue: () => refunds.list(), markRefunded, get server() { return server; }, store, chain, world, claimAll, claimNearTimeout, autoClaims, recovery, recovered, runId,
     refundTimeout: () => currentTimeout, rotate: rotateIfNeeded, settle: () => claiming, close: () => { if (pendingTimer) clearInterval(pendingTimer); if (timer) clearInterval(timer); if (nearTimer) clearInterval(nearTimer); if (recoveryTimer) clearInterval(recoveryTimer); }, listen: (port = cfg.listen.port, host = cfg.listen.host) =>
     new Promise((ok) => { const s = http.createServer(handler).listen(port, host, () => ok(s)); }) };
 }

@@ -67,7 +67,7 @@ function writeThrough(instance, Proto, persist, before = () => {}) {
  * started/recorded/recovery-required, committed replays) and batch/claim state survive a restart.
  * Legacy snapshot rows (pre-journal) are the baseline. Compaction is deferred (README Known limitations).
  */
-export function createPersistentServerStore(db, ns = "server-channels", { ackReplayErrors = /^(1|true)$/i.test(process.env.X402_ACK_REPLAY_ERRORS ?? ""), onFatal = (e) => { console.error(`[x402-store] FATAL journal write failed, exiting: ${e?.message}`); process.exit(70); } } = {}) {
+export function createPersistentServerStore(db, ns = "server-channels", { ackReplayErrors = /^(1|true)$/i.test(process.env.X402_ACK_REPLAY_ERRORS ?? ""), onFatal = (e) => { console.error(`[x402-store] FATAL journal write failed, exiting: ${e?.message}`); process.exit(70); }, onReplayError = null } = {}) {
   db.exec("CREATE TABLE IF NOT EXISTS store_journal (seq INTEGER PRIMARY KEY AUTOINCREMENT, ns TEXT NOT NULL, at INTEGER NOT NULL, method TEXT NOT NULL, args TEXT NOT NULL)");
   const rows = new Map(kvAll(db, ns));
   const channels = [...rows].filter(([k]) => k.startsWith("channel:")).map(([, v]) => v);
@@ -128,8 +128,12 @@ export function createPersistentServerStore(db, ns = "server-channels", { ackRep
     pending.length = 0; replaying = false;
     // R5-M3: any replay error = the rebuilt state may diverge from what upstream saw. Fail closed: mutating transitions
     // refuse (so paid routes cannot proceed) until the operator reconciles and restarts with X402_ACK_REPLAY_ERRORS=1.
-    if (replayErrors.length && !ackReplayErrors) { store.replayFailed = replayErrors.slice();
-      console.error(`[x402-store] journal replay failed (${replayErrors.length} error(s)); refusing state transitions (fail closed). First: ${JSON.stringify(replayErrors[0])}`); }
+    if (replayErrors.length && !ackReplayErrors) store.replayFailed = replayErrors.slice();
+    // R6 (info): ALWAYS alert on replay errors, also when acknowledged with X402_ACK_REPLAY_ERRORS=1 (then state is
+    // served from a possibly divergent rebuild, which the operator must still see). onReplayError is the alert hook.
+    if (replayErrors.length) {
+      console.error(`[x402-store] ALERT journal replay failed (${replayErrors.length} error(s)); ${ackReplayErrors ? "ACKNOWLEDGED via X402_ACK_REPLAY_ERRORS, serving anyway" : "refusing state transitions (fail closed)"}. First: ${JSON.stringify(replayErrors[0])}`);
+      try { onReplayError?.({ errors: replayErrors.slice(), acknowledged: !!ackReplayErrors }); } catch (e) { console.error(`[x402-store] onReplayError hook threw: ${e?.message}`); } }
     return { replayed: n, errors: replayErrors };
   })();
   // Open claim attempts after replay (H1 restart recovery input), incl. claimAmount for correct booking (N-M3).

@@ -218,19 +218,25 @@ serve depth evidence *before* the payment is broadcast: it re-proves a known dee
 and nothing is broadcast. If the tx is broadcast but depth can't be proven within the in-request replays, the payment is
 held as **pending** (SQLite `kv` ns `exact-pending`, shown on the dashboard as `pendingExact`) and the payer gets
 `503 payment_pending` with the txid. Retrying the **same** payment delivers the data; it is never charged twice.
-Pending payments expire after `exactPendingTtlMs` (default 10 min) into a refund-due queue (SQLite ns `exact-refund-due`,
+Pending payments expire after `exactPendingTtlMs` into a refund-due queue (SQLite ns `exact-refund-due`,
 dashboard `refundsDue`, ledger `pending-expired`); retries then get `410 payment_expired_refund_due`. Refunds are
 operator-approved: send it from your TN10 wallet, then record it with `x402-gateway refunds --txid <paid tx> --refund-tx <refund tx>`
-(`x402-gateway refunds` lists the queue).
+(`x402-gateway refunds` lists the queue). `exactPendingTtlMs` defaults to, and may not exceed, the payer's
+authorization lifetime (`maxTimeoutSeconds`, default 60 s); startup refuses a larger value, because a payment past its
+authorization can never be re-presented.
 
 **`batch.openChargeSompi`.** The call that opens a batch channel is charged at least this amount (real-chain default:
 `settlement.minClaimNetSompi` + claim fee), so every channel is claimable from its first call. It must be >= `minClaimNetSompi` + claim fee (startup refuses less).
 The 402 challenge, the paid price and the per-IP cap use ONE rule: a channel is "below minimum" until its cumulative
 charge reaches the threshold recorded when its open charge was paid (a later fee/minimum change never re-charges it).
-Later calls on the channel pay the route price.
+Later calls on the channel pay the route price. Without a payment, the 402 offer is decided per client IP unless the client
+names its own channel with the optional `kasgate-channel-id: <64 hex>` header; a channel that is active and was opened from
+the same client IP key is then priced by the same per-channel rule (an unknown or foreign id falls back to the IP rule).
 **Journal replay** restores payment state on start. If any journal row fails to replay, the gateway fails closed: paid
 routes answer `503 gateway_state_unavailable` and state transitions are refused until you reconcile and restart with
-`X402_ACK_REPLAY_ERRORS=1` (errors are shown on the dashboard as `replayErrors`).
+`X402_ACK_REPLAY_ERRORS=1` (errors are shown on the dashboard as `replayErrors`). Every replay failure, acknowledged or
+not, is logged as `[x402-store] ALERT`, booked in the ledger as `store-replay-alert`, and passed to the optional
+`onReplayError` hook of `createGateway` (wire it to your pager).
 
 ## Hardening
 
